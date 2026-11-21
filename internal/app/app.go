@@ -5,6 +5,7 @@ package app
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"path/filepath"
 	"sync/atomic"
@@ -26,16 +27,40 @@ type App struct {
 	srv     *http.Server
 	closers []io.Closer // released in reverse order on shutdown
 	ready   atomic.Bool
+
+	running atomic.Bool
+	started chan struct{}
+	addr    string // set before started is closed
+
+	listen func(network, address string) (net.Listener, error) // net.Listen; replaced in tests
 }
 
 // Ready reports whether the service should receive traffic. It is true from
 // construction until shutdown begins, and backs the /readyz probe.
 func (a *App) Ready() bool { return a.ready.Load() }
 
+// Option customises New.
+type Option func(*options)
+
+type options struct {
+	logOutput io.Writer
+}
+
+// WithLogOutput sends the console copy of the logs to w instead of standard
+// output. The log files are unaffected.
+func WithLogOutput(w io.Writer) Option {
+	return func(o *options) { o.logOutput = w }
+}
+
 // New builds the dependency graph. All concrete types are chosen here and
 // nowhere else; everything below this function sees interfaces.
-func New(cfg config.Config) (*App, error) {
+func New(cfg config.Config, opts ...Option) (*App, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	log, err := logger.New(logger.Config{
+		Stdout:     o.logOutput,
 		Level:      cfg.LogLevel,
 		Dir:        cfg.LogDir,
 		MaxSizeMB:  cfg.LogMaxSizeMB,
@@ -46,7 +71,7 @@ func New(cfg config.Config) (*App, error) {
 		return nil, fmt.Errorf("init logger: %w", err)
 	}
 
-	a := &App{cfg: cfg, log: log}
+	a := &App{cfg: cfg, log: log, started: make(chan struct{}), listen: net.Listen}
 	// The logger is registered first so it is closed last and the final
 	// shutdown lines still reach the files.
 	a.closers = append(a.closers, log)

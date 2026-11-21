@@ -11,7 +11,14 @@ import (
 
 // Config holds runtime settings, all sourced from environment variables.
 type Config struct {
-	Port            int
+	Port int
+
+	// ShutdownDelay is how long the service reports "not ready" before it stops
+	// listening, so a load balancer can notice /readyz failing and stop sending
+	// traffic. Zero stops listening immediately.
+	ShutdownDelay time.Duration
+	// ShutdownTimeout bounds how long in-flight requests get to finish once the
+	// service has stopped listening.
 	ShutdownTimeout time.Duration
 
 	HTTPReadHeaderTimeout time.Duration
@@ -48,6 +55,7 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 
 	cfg := Config{
 		Port:            r.int("PORT", 8080),
+		ShutdownDelay:   r.duration("SHUTDOWN_DELAY", 0),
 		ShutdownTimeout: r.duration("SHUTDOWN_TIMEOUT", 10*time.Second),
 
 		HTTPReadHeaderTimeout: r.duration("HTTP_READ_HEADER_TIMEOUT", 5*time.Second),
@@ -82,6 +90,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("config: PORT %d out of range 1-65535", c.Port)
 	case c.ShutdownTimeout <= 0:
 		return fmt.Errorf("config: SHUTDOWN_TIMEOUT must be positive, got %s", c.ShutdownTimeout)
+	case c.ShutdownDelay < 0:
+		return fmt.Errorf("config: SHUTDOWN_DELAY must not be negative, got %s", c.ShutdownDelay)
 	case c.HTTPReadHeaderTimeout <= 0 || c.HTTPReadTimeout <= 0 || c.HTTPWriteTimeout <= 0 || c.HTTPIdleTimeout <= 0:
 		return fmt.Errorf("config: HTTP_* timeouts must be positive")
 	case c.DataDir == "":

@@ -504,58 +504,30 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 - Done when: every endpoint in section 5 returns the documented status codes, and a missing flag returns 404 (verified for every route that takes a flag name).
 
 ### FFS-8A Application bootstrap and graceful shutdown (P0)
-Implements `internal/app` and the lifecycle in section 2.4. Work it right after FFS-8.
+Implements `internal/app` and the lifecycle in section 2.4. Worked right after FFS-8, which had already landed `app.New` (the composition root), the readiness flag and `/readyz`. This ticket finished `Run`, added the drain delay, and tested the whole lifecycle, including the real binary receiving real signals.
 
-Already done in FFS-8: `app.New` builds the whole graph (file DAOs, LFU cache registered as a closer so the janitor stops on shutdown, evaluator, services, handlers, router), the `ready` flag exists and flips to false when shutdown begins, and `/readyz` reports it. What remains here is the lifecycle tests below, the closers-order test, and verifying the signal behaviour on the real binary.
+**Design**
+- `app.New(cfg, opts...)` builds the graph and registers every resource with a `Close` in creation order. The logger is registered first so it is closed last and the final lines reach the files (pinned by a test, because nothing else would notice). `WithLogOutput(w)` redirects the console copy of the logs; tests use it to stay quiet.
+- `app.Run(ctx)`:
+  1. A second call returns an error (run-once guard).
+  2. The listener is bound synchronously, so "address already in use" is returned straight away instead of being discovered later on another goroutine. `Started()` is closed once it is bound and `Addr()` reports the real address, which is how tests use port 0.
+  3. `Serve` runs in its own goroutine. Any error other than `http.ErrServerClosed` goes to a buffered channel; `Run` selects on that and `ctx.Done()`. A server failure flips readiness, releases resources and returns `server failed: ...`.
+  4. On signal: log it, flip readiness to false (`/readyz` answers 503), and if `SHUTDOWN_DELAY` is set keep serving for that long so a load balancer sees the failing probe before the listener closes. A server failure during the delay is logged and cuts the wait short.
+  5. `Shutdown` with `SHUTDOWN_TIMEOUT`. If it does not finish, log a warning, force `Close()` and return the error wrapped as `graceful shutdown: ...`.
+  6. Wait for the serve goroutine, then close resources in reverse creation order (cache and its janitor first, logger last). A close error is returned only if nothing earlier failed, but every closer still runs.
+- Exit codes live in `main`: `Run` returns nil after a clean shutdown (exit 0); startup or runtime failures print `fatal: ...` to stderr and exit 1. Both SIGINT and SIGTERM are handled; a second signal during shutdown does nothing.
+- Config added: `SHUTDOWN_DELAY` (default 0, must not be negative), alongside `SHUTDOWN_TIMEOUT` and the `HTTP_*` timeouts.
+- The listen function is an unexported field defaulting to `net.Listen`, so tests can inject a listener that fails on demand. There are no test-only fields in production code.
 
-- `app.New(cfg) (*App, error)`: the single composition root. It builds the logger, DAOs, cache, services, handlers, router, and `http.Server`, and registers every resource with a `Close` in a closer list (`[]io.Closer`) in creation order. It sets `http.Server` timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`) from config, which also protects against slowloris.
-- `app.Run(ctx) error`:
-  1. Start `ListenAndServe` in its own goroutine. Report any error other than `http.ErrServerClosed` on a buffered `errCh`.
-  2. `select` on `ctx.Done()` (SIGINT or SIGTERM) and `errCh` (the server failed, for example the port is in use).
-  3. On shutdown: log "shutdown signal received", flip a readiness flag (`atomic.Bool`) so `/readyz` returns 503 and the orchestrator stops routing new traffic, then call `srv.Shutdown(ctxWithTimeout)` with `SHUTDOWN_TIMEOUT` (default 10s) to drain in-flight requests.
-  4. If the drain times out, log a warning and call `srv.Close()` to force it.
-  5. Close the closers in reverse creation order: cache (stops the janitor), then the logger last so the final lines reach the file.
-  6. Return the first meaningful error so `main` can set the exit code.
+**Tests**
+- `internal/app` (93% coverage): serve then stop cleanly on cancel; an in-flight slow request completes during shutdown while a new connection is refused; `/readyz` is 503 while draining (and `/healthz` still 200); the drain delay is honoured; a drain timeout forces `Close` and is reported; the janitor goroutine is gone after `Run` returns; the port already taken, `Run` twice, and `New` failures all clean up after themselves; closers run in reverse order and all run even after one fails; a server failure, and a server failure during the drain, are reported and release resources; a close error is surfaced; `Run` does not return before the serve goroutine; the logger is registered first; and 20 concurrent clients during shutdown each get an answer or a refusal, never a hang.
+- `cmd/server` (re-executes the test binary as the server, so it runs the real `main` with real signals): SIGTERM and SIGINT give exit 0 and the expected log lines; `SHUTDOWN_DELAY` keeps `/healthz` at 200 while `/readyz` is 503 and delays the exit; an occupied port, unparsable config, out-of-range port and negative delay each exit 1 with `fatal:`; a second SIGTERM does not restart or break the shutdown.
+- Stress: `-race -count=15 -cpu 1,2,8` on `internal/app` and `-count=4 -cpu 1,4` on `cmd/server`, clean.
+- Mutation testing of `Run`, `closeAll` and the registration order: 16 planted bugs, 15 killed by a relevant test. The survivor (not waiting for the serve goroutine) is equivalent because `http.Server.Shutdown` already waits for `Serve` to return in Go 1.22; the wait stays as a guarantee that does not depend on that detail.
 
-```go
-func (a *App) Run(ctx context.Context) error {
-    errCh := make(chan error, 1)
-    go func() {
-        a.log.Info("server listening", "addr", a.srv.Addr)
-        if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-            errCh <- err
-        }
-    }()
-
-    select {
-    case err := <-errCh:
-        a.closeAll()
-        return fmt.Errorf("server failed: %w", err)
-    case <-ctx.Done():
-    }
-
-    a.log.Info("shutdown signal received")
-    a.ready.Store(false)
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
-    defer cancel()
-    err := a.srv.Shutdown(shutdownCtx)
-    if err != nil {
-        a.log.Warn("graceful shutdown timed out, forcing close", "err", err)
-        _ = a.srv.Close()
-    }
-    a.closeAll()
-    return err
-}
-```
-
-- Config additions: `SHUTDOWN_TIMEOUT`, `HTTP_READ_HEADER_TIMEOUT`, `HTTP_READ_TIMEOUT`, `HTTP_WRITE_TIMEOUT`, `HTTP_IDLE_TIMEOUT`.
-- Tests:
-  - Start the app on a random port (`:0`) in a goroutine, send a request, cancel the context, and assert `Run` returns nil.
-  - A slow in-flight request (a test handler that sleeps) still completes during shutdown, and a new request after shutdown starts is refused.
-  - `/readyz` returns 503 once shutdown begins.
-  - The janitor goroutine is gone after `Run` returns.
-  - Starting on an occupied port makes `Run` return an error.
-- Done when: `kill -TERM <pid>` on the running binary logs the shutdown sequence, finishes in-flight work, and exits with code 0, and `go test -race` is clean.
+**Notes**
+- A `-race` binary sleeps one second at exit by default; the subprocess tests set `GORACE=atexit_sleep_ms=0`. The real binary stops in well under a millisecond when idle.
+- Done when: `kill -TERM <pid>` on the running binary logs the shutdown sequence, finishes in-flight work, and exits with code 0, and `go test -race` is clean. Both verified.
 
 ### FFS-9 Tests (P1)
 - Integration test with `httptest.NewServer` and real file DAOs in `t.TempDir()`: create, evaluate (off), set override, evaluate (on, reason `user_override`), evaluate again (`source=cache`), update, evaluate (invalidated), read audit trail, delete, evaluate returns 404, and a validation failure returns 400.
