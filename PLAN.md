@@ -530,8 +530,26 @@ Implements `internal/app` and the lifecycle in section 2.4. Worked right after F
 - Done when: `kill -TERM <pid>` on the running binary logs the shutdown sequence, finishes in-flight work, and exits with code 0, and `go test -race` is clean. Both verified.
 
 ### FFS-9 Tests (P1)
-- Integration test with `httptest.NewServer` and real file DAOs in `t.TempDir()`: create, evaluate (off), set override, evaluate (on, reason `user_override`), evaluate again (`source=cache`), update, evaluate (invalidated), read audit trail, delete, evaluate returns 404, and a validation failure returns 400.
-- Handler tests for error mapping and validation edge cases.
+Handler tests for error mapping and validation edge cases already landed with FFS-8 (about 40 tests at 100% coverage, with fake services behind the real router and middleware), and the router tests run the real services on in-memory storage. What was missing was the real thing end to end, so this ticket adds `internal/integration`: black-box tests that start the production composition root (`app.New` and `app.Run`) with real file DAOs, the real LFU cache and the real logger, and talk to it over real TCP. Nothing is faked. Only the public `app` API is used, and the wire types are redeclared in the tests so they check the documented JSON rather than the server's own structs.
+
+| Test | What it proves |
+| --- | --- |
+| `TestFlagLifecycleOnRealFiles` | The full sequence: validation failures leave no trace; create, evaluate off (`global_off`, `store`), override (`user_override`), evaluate again (`cache`), update (invalidated), remove override, audit trail in order with actors, delete, evaluate 404. Then `flags.json` no longer holds the flag and `audit.jsonl` has one valid line per write. |
+| `TestEveryRequestIsTraceableThroughLogsAndAudit` | One request id travels from the client header to the response header, the access-log line (time, level, actor, method, path, status) and the audit record. Generated ids when absent; unsafe client ids are not reused; a clean run leaves `error.log` empty. |
+| `TestClientErrorsAreWarningsNotErrors` | 4xx responses log at `warn`, so `error`-level records mean real server faults. |
+| `TestStateSurvivesARestart` | Flags, overrides, deletes and the audit history survive a restart; the cache starts cold but answers correctly; versions and history continue; the log file is appended, not replaced. |
+| `TestStartsAfterACrashLeftDebrisOnDisk` | A half-written audit line and an unfinished `flags.json.tmp-*` file do not stop startup or leak data, and the next write is recorded cleanly across two more restarts. |
+| `TestInvalidationIsScopedToTheFlagThatChanged` | Updating flag A leaves flag B's cached answers in place. |
+| `TestACachedAnswerExpiresAfterItsTTL` | Real clock and real janitor: a cached answer goes back to the store after its TTL. |
+| `TestCapacityPressureNeverChangesAnAnswer` | A 5-entry cache under 40 users never returns a wrong answer. |
+| `TestConcurrentWritersAndReadersLeaveAConsistentRecord` | 6 writers and 6 readers on one flag: no 5xx, a gap-free audit chain (every entry starts from the previous entry's end state), final version equals the number of entries, store equals the last audit state, and once writes stop every answer, cached or not, matches the truth. |
+| `TestAnAcknowledgedWriteIsNeverFollowedByAStaleAnswer` | Background readers keep the cache hot while a writer toggles the flag 80 times; each acknowledged write is visible to the very next evaluation. |
+| `TestConcurrentCreatesOfOneNameHaveOneWinner` | 25 concurrent creates give one 201, 24 clean 409s and one audit entry. |
+| `TestWritesThatChangeNothingAreNoOps` | A repeated update or override is acknowledged but changes no version, adds no audit entry and keeps cached answers; removing an override that was never set is a 404. |
+
+- Verification: `-race -count=10 -cpu 1,2,8` is clean. Thirteen planted bugs were run against the suite: 11 killed by a relevant test (missing invalidation on update, override and delete; shared cache tag; entries never expiring; torn audit tail not repaired; request id missing from audit; 4xx logged as errors; no per-flag lock; no-op writes audited; `flags.json` never written; override ranked below global state). Two survivors, both understood: skipping invalidation on create is equivalent today because errors are never cached, but it will matter once flag dependencies exist (FFS-13); and reading the cache epoch after evaluating (defeating the stale-fill guard) is a microsecond window that no HTTP-level test can hit reliably, so it is caught deterministically by `TestStaleFillIsRefused` in the service unit tests.
+- Also in this ticket: a curl-based script, `sample_test/integration_test.sh` (`make integration`), checks the same behaviour against any running server.
+- Done when: the sequence above passes against real files and `go test -race ./...` is clean. Both verified.
 
 ### FFS-10 CI (P1)
 - `.github/workflows/ci.yml` on push and pull request: setup-go, `go vet ./...`, `gofmt` check, `go test -race -cover ./...`, and `go build ./...`.
