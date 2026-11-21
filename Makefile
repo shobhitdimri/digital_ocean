@@ -1,7 +1,7 @@
 BINARY := bin/feature-flag-service
 PKGS   := ./...
 
-.PHONY: run build test test-race cover lint fmt vet tidy clean
+.PHONY: run build test test-race integration cover lint fmt vet tidy clean
 
 run:
 	go run ./cmd/server
@@ -14,6 +14,9 @@ test:
 
 test-race:
 	go test -race -cover $(PKGS)
+
+integration:
+	./sample_test/integration_test.sh
 
 cover:
 	go test -race -coverprofile=coverage.out $(PKGS)
