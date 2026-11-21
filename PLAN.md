@@ -552,7 +552,21 @@ Handler tests for error mapping and validation edge cases already landed with FF
 - Done when: the sequence above passes against real files and `go test -race ./...` is clean. Both verified.
 
 ### FFS-10 CI (P1)
-- `.github/workflows/ci.yml` on push and pull request: setup-go, `go vet ./...`, `gofmt` check, `go test -race -cover ./...`, and `go build ./...`.
+`.github/workflows/ci.yml` runs on every push, every pull request and on demand. A newer push to the same ref cancels the older run, and the token is read-only (`permissions: contents: read`). Four jobs, independent where possible so one kind of failure never hides another:
+
+| Job | What it does | Fails when |
+| --- | --- | --- |
+| `lint` | `gofmt -s -l` (lists the offending files), `go vet ./...`, `go mod tidy` followed by `git diff --exit-code go.mod go.sum`, `go mod verify` | formatting drift, a vet finding, a stale or untidy module file, a tampered module |
+| `test` | `go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile` on Go 1.22 (the minimum in `go.mod`) and `stable`; total coverage goes to the job summary and the profile is uploaded as an artifact | any test or data race fails, or a test only passes in one order, or the newest Go breaks something |
+| `build` | static builds (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`, the same flags as `make build`) for linux/amd64, linux/arm64 and darwin/arm64 | the code stops compiling on a target platform |
+| `e2e` | runs `sample_test/integration_test.sh` after `test` passes: real binary, HTTP, SIGTERM, restart, persistence | any of its 77 checks fails |
+
+- `-race` needs cgo, which the Ubuntu runner has; `-count=1` bypasses Go's test cache so CI always runs the tests; `-shuffle=on` surfaces order dependence.
+- `make ci` runs the same steps locally (lint, tidy check, verify, race tests with coverage, build, end-to-end script), so a green `make ci` predicts a green pipeline.
+- Verification, since a pipeline cannot be run from here: `actionlint` reports no problems; every `run:` step was extracted from the YAML and executed locally; each gate was shown to trip (an unformatted file, a `go vet` error, a stale `go.sum`, a failing unit test and a failing e2e check all exit 1 with a readable message); the suite passes on Go 1.22.2 and 1.24.5, shuffled, pinned to a single core with `-cpu 1`, and with a CPU hog competing for that core, which approximates a small shared runner; all three build targets compile.
+- Actions are pinned to major versions (`checkout@v4`, `setup-go@v5`, `upload-artifact@v4`). Pinning to commit SHAs is the stricter option if supply-chain policy requires it.
+- To make CI binding, enable branch protection on the default branch and require `Format, vet and modules`, `Test (Go 1.22)`, `Test (Go stable)` and the `Build` and `End-to-end script` checks.
+- Done when: the workflow is lint-clean and every step passes locally. Both verified; the first real run happens when the repository is pushed to GitHub (deferred).
 
 ### FFS-11 Documentation (P1)
 - README: overview, setup and run, configuration table, API reference with curl examples, evaluation rules, caching (LFU choice, key format, tags, TTL, invalidation strategy, multi-instance caveat), logging, audit trail, project layout, the architecture diagrams from section 2, testing, and future work.
