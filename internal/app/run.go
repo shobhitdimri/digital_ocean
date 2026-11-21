@@ -10,7 +10,7 @@ import (
 // Run starts the HTTP server and blocks until ctx is cancelled or the server
 // fails. On cancellation it drains in-flight requests before returning.
 //
-// Readiness handling and shutdown tests arrive in FFS-8A.
+// Shutdown tests arrive in FFS-8A.
 func (a *App) Run(ctx context.Context) error {
 	a.log.Info("starting server",
 		"addr", a.srv.Addr,
@@ -36,6 +36,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	a.log.Info("shutdown signal received", "timeout", a.cfg.ShutdownTimeout.String())
+	a.ready.Store(false)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
 	defer cancel()
 

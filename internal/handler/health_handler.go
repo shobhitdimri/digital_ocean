@@ -1,23 +1,39 @@
-// Package handler contains HTTP handlers. Handlers translate HTTP to service
-// calls and back; they hold no business logic.
 package handler
 
 import (
-	"encoding/json"
 	"net/http"
+
+	"feature-flag-service/pkg/httpx"
 )
 
-// HealthHandler serves liveness checks.
-type HealthHandler struct{}
-
-// NewHealthHandler creates a HealthHandler.
-func NewHealthHandler() *HealthHandler {
-	return &HealthHandler{}
+// Readiness reports whether the service should receive traffic.
+type Readiness interface {
+	Ready() bool
 }
 
-// Liveness reports that the process is up.
+// HealthHandler serves the liveness and readiness probes.
+type HealthHandler struct {
+	readiness Readiness
+}
+
+// NewHealthHandler creates a HealthHandler.
+func NewHealthHandler(readiness Readiness) *HealthHandler {
+	return &HealthHandler{readiness: readiness}
+}
+
+// Liveness handles GET /healthz. It answers 200 whenever the process can serve
+// a request, and deliberately checks nothing else: a failing liveness probe
+// makes an orchestrator restart the process.
 func (h *HealthHandler) Liveness(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// Readiness handles GET /readyz. It answers 503 once shutdown has begun, so a
+// load balancer stops sending new requests while in-flight ones finish.
+func (h *HealthHandler) Readiness(w http.ResponseWriter, _ *http.Request) {
+	if h.readiness.Ready() {
+		httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+		return
+	}
+	httpx.WriteJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "shutting_down"})
 }

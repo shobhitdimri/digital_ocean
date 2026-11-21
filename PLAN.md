@@ -213,13 +213,16 @@ feature-flag-service/
       audit_service.go         # read-only audit history
       keyedlock.go             # per-flag lock that honours context cancellation
     handler/
-      flag_handler.go
-      evaluate_handler.go
-      audit_handler.go
-      health_handler.go
-      dto.go                   # request and response structs
+      flag_handler.go          # FlagCRUD interface + create, list, get, update, delete
+      override_handler.go      # OverrideManager interface + set, remove
+      evaluate_handler.go      # FlagEvaluator interface
+      audit_handler.go         # AuditHistory interface
+      health_handler.go        # Readiness interface, /healthz and /readyz
+      errors.go                # the one place domain errors become HTTP statuses
+      dto.go                   # request and response structs (the wire format)
     middleware/
-      request_id.go
+      middleware.go            # Middleware type, Chain, response status recorder
+      requestid.go
       actor.go
       logging.go
       recover.go
@@ -236,7 +239,8 @@ feature-flag-service/
       logger.go                # slog setup: JSON, file and stdout, level split, rotation
       context.go               # logger and request id in context
     httpx/
-      response.go              # WriteJSON, WriteError with domain error -> status mapping
+      response.go              # WriteJSON, WriteError, the single error body shape
+      decode.go                # strict DecodeJSON and RequestError (domain-agnostic)
   api/
     openapi.yaml               # optional, if time allows
   data/                        # runtime data (gitignored): flags.json, audit.jsonl
@@ -254,7 +258,7 @@ Layering rules (enforced by review):
 
 - `domain` imports nothing from the project.
 - `service` depends only on `dao` and `cache` interfaces, never on concrete types or `net/http`.
-- `handler` depends only on service interfaces and `httpx`.
+- `handler` depends only on narrow interfaces it declares itself, the service-layer types they mention, and `httpx`. `httpx` knows nothing about the domain, so the domain-error to status mapping lives in `handler/errors.go`.
 - Concrete implementations are chosen only in `internal/app` (called from `cmd/server/main.go`).
 - `main.go` contains no business logic, no wiring details, and no goroutines of its own.
 - Interfaces are declared next to their consumer's contract (`dao`, `cache`) so fakes are trivial in tests.
@@ -352,14 +356,21 @@ type AuditEntry struct {
 - GET `/v1/flags` - list (200)
 - GET `/v1/flags/{name}` - read (200, 404)
 - PUT `/v1/flags/{name}` - update description, enabled, and later rollout and requires (200, 400, 404)
-- DELETE `/v1/flags/{name}` - delete (204, 404, 409 if required by others)
+- DELETE `/v1/flags/{name}` - delete (204, 404; 409 if required by others once FFS-13 lands)
 - PUT `/v1/flags/{name}/overrides/{userId}` - set override, body `{"enabled": true}` (200, 400, 404)
 - DELETE `/v1/flags/{name}/overrides/{userId}` - remove override (204, 404)
 - GET `/v1/evaluate?flag=X&user_id=U` - response `{"flag":"X","user_id":"U","enabled":true,"reason":"user_override","source":"cache|store"}` (200, 400, 404)
-- GET `/v1/flags/{name}/audit?limit=50` - audit trail (200, 404)
+- GET `/v1/flags/{name}/audit?limit=50` - audit trail, newest first (200, 400). An unknown or deleted flag returns 200 with its (possibly empty) history, not 404, so the history of a deleted flag stays readable.
 - GET `/healthz` and `/readyz` - health checks
 
-Conventions: writes require the `X-Actor` header (400 if missing). A client-supplied `X-Request-ID` is accepted or generated and echoed back. Errors use a single JSON shape `{"error":{"code":"not_found","message":"...","request_id":"..."}}`. Unknown JSON fields are rejected, and request bodies are limited to 1 MB. Domain errors map to 400, 404, 409, or 500 in `httpx.WriteError`, and an unexpected error never leaks internals.
+Conventions:
+
+- Writes (POST, PUT, DELETE) require the `X-Actor` header (400 `missing_actor`). Reads without it are recorded as `anonymous`. A present but invalid actor is rejected on any method (400 `invalid_actor`).
+- A client-supplied `X-Request-ID` is reused if it is at most 64 characters of letters, digits, `-`, `_` or `.`; anything else is replaced, so a client cannot inject newlines into the log. The id is echoed in the response header and in every error body.
+- Errors use a single JSON shape `{"error":{"code":"not_found","message":"...","request_id":"..."}}`, including the router's own 404 and 405 (with an `Allow` header).
+- Status mapping (`handler/errors.go`): invalid input 400 `invalid_request`, not found 404 `not_found`, duplicate 409 `already_exists`, version conflict 409 `conflict`, audit write failed after the change 500 `audit_failed`, request timed out 504 `timeout`, client went away 499 `client_closed_request`, anything else 500 `internal` with a fixed message (the real cause is logged with the request id, never sent).
+- Request bodies: JSON only (415 for another Content-Type), unknown fields rejected, an empty, malformed or multi-value body rejected (400), and a body over 1 MiB rejected (413).
+- Creating a flag without `enabled` starts it disabled. Updates and overrides are partial: an omitted field is unchanged, and an override requires `enabled`.
 
 ## 6. Logging design (`pkg/logger`)
 
@@ -485,11 +496,17 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 - Tests: audit contents (before, after, actor, request id, time) for every action; invalidation and audit ordering; conflict retry using fresh data; bounded retry exhaustion; storage and audit failures; cancellation after commit; lock waits that honour deadlines; 40 concurrent writers to one flag losing no updates with audit order equal to version order; a concurrent mixed-operation run whose audit trail replays to the stored state; deterministic stale-fill refusal; and a read-your-writes test under `-race` with readers racing a writer that toggles a flag.
 
 ### FFS-8 HTTP layer (P0)
-- `router` with Go 1.22 patterns, middleware chain (recover -> request id -> actor -> logging -> body limit), handlers, DTOs, `httpx` response and error mapping.
-- Done when: every endpoint in section 5 returns the documented status codes, and a missing flag returns 404.
+- `pkg/httpx`: `WriteJSON` (encodes before sending, so a failure is a clean 500), `WriteError`, and a strict `DecodeJSON`.
+- Middleware, outermost first: request id, actor, logging, recover, body limit. This differs from the first sketch, which put recover first. With logging outside recover, a request whose handler panicked still gets an access-log line with status 500 and its request id, and recover can still use the request id for the error body.
+- Handlers, each with its own consumer-defined interface (`FlagCRUD`, `OverrideManager`, `FlagEvaluator`, `AuditHistory`, `Readiness`), so each sees only what it uses. The router takes them through `router.Deps`, validates that none is missing, and wraps Go's `ServeMux` so unknown paths and wrong methods also answer in the JSON error shape.
+- The composition root already wires the real file DAOs, LFU cache, evaluator, services and handlers, so the binary serves the full API. `/readyz` reads the app's readiness flag.
+- Tests: handlers run behind the real router and middleware with fake services, so every error the services can produce is injected and checked for its status, code and for leaks. A real-stack test runs the actual services, DAOs and cache behind an HTTP server: the full lifecycle, every documented status code, one winner among 30 concurrent creates, and read-your-writes while clients hammer the same flag.
+- Done when: every endpoint in section 5 returns the documented status codes, and a missing flag returns 404 (verified for every route that takes a flag name).
 
 ### FFS-8A Application bootstrap and graceful shutdown (P0)
 Implements `internal/app` and the lifecycle in section 2.4. Work it right after FFS-8.
+
+Already done in FFS-8: `app.New` builds the whole graph (file DAOs, LFU cache registered as a closer so the janitor stops on shutdown, evaluator, services, handlers, router), the `ready` flag exists and flips to false when shutdown begins, and `/readyz` reports it. What remains here is the lifecycle tests below, the closers-order test, and verifying the signal behaviour on the real binary.
 
 - `app.New(cfg) (*App, error)`: the single composition root. It builds the logger, DAOs, cache, services, handlers, router, and `http.Server`, and registers every resource with a `Close` in a closer list (`[]io.Closer`) in creation order. It sets `http.Server` timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`) from config, which also protects against slowloris.
 - `app.Run(ctx) error`:
