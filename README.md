@@ -524,16 +524,18 @@ PLAN.md                the engineering plan: tickets, design decisions, diagrams
 
 The repository contains a `Dockerfile` (multi-stage, static binary, distroless, non-root user, exec-form `ENTRYPOINT` so the process is PID 1 and receives SIGTERM for the graceful shutdown) and an App Platform spec in `.do/app.yaml`.
 
-```bash
-# from a machine with doctl, once the code is in the GitHub repo named in the spec
-doctl apps create --spec .do/app.yaml
-doctl apps list                       # note the live URL, https://<app>.ondigitalocean.app
+It is deployed in Bangalore (`blr`) at **https://ffs-go-feature-flags-9rnac.ondigitalocean.app**. Try it from any shell:
 
-curl https://<app>.ondigitalocean.app/healthz
-curl -X POST https://<app>.ondigitalocean.app/v1/flags -H 'X-Actor: me' -H 'Content-Type: application/json' \
+```bash
+U=https://ffs-go-feature-flags-9rnac.ondigitalocean.app
+curl $U/healthz
+curl -X POST $U/v1/flags -H 'X-Actor: me' -H 'Content-Type: application/json' \
   -d '{"name":"new-ui","enabled":true,"rollout_percent":50}'
-curl 'https://<app>.ondigitalocean.app/v1/evaluate?flag=new-ui&user_id=alice'
+curl "$U/v1/evaluate?flag=new-ui&user_id=alice"
+curl "$U/v1/flags/new-ui/audit"
 ```
+
+To create it again (or elsewhere), `doctl apps create --spec .do/app.yaml`. The app builds from the repo's `main` branch with the Dockerfile; the spec uses the plain Git source so DigitalOcean needs no GitHub connection to a public repository.
 
 Things to know before relying on it:
 
@@ -541,12 +543,12 @@ Things to know before relying on it:
 - **There is no authentication.** `X-Actor` records who made a change, it does not prove it. A public deployment lets anyone create, change and delete flags. Put it behind a gateway or add API-key auth before putting real flags on it.
 - **Single instance only.** The cache and the file store are per process, so keep `instance_count: 1`.
 - **Shutdown window.** The platform's stop timeout must exceed `SHUTDOWN_DELAY + SHUTDOWN_TIMEOUT` (0 + 10s by default).
-- The image has been checked by building the binary with the Dockerfile's exact flags and running it against real files. The image build itself runs on DigitalOcean.
+- The image builds and runs on App Platform (checked: health, readiness, create, rollout, prerequisite gate, cycle rejection and audit all answered correctly on the public URL). Docker is not installed on the development machine, so the image was not built locally.
 
 ## Roadmap
 
 Percentage rollout and flag dependencies are built. Planned as the next ticket in `PLAN.md`:
 
-- **Deployment.** The Dockerfile and App Platform spec are in place (see above); the live deployment is pending push access to the GitHub repository.
+- **Deployment.** The Dockerfile and App Platform spec are in place (see above); the service is deployed (see above).
 
 Possible later work: Postgres in place of the JSON files, Redis or pub/sub invalidation for multiple instances, and an OpenAPI description.

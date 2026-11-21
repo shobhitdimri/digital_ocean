@@ -615,6 +615,8 @@ Done. A flag can list `requires` (other flags that must be on for the same user)
 **Tests** evaluator (gate, per-user, chains, missing, consulted tags, diamond, cycle, depth, lookup failure, nil Evaluate), domain, DAO contract (both stores) and file format, service, handler, and `internal/integration/dependency_test.go` end to end. Live check with curl: gate, override bypass refused, cycle 409, unknown 400, delete-required 409, release then delete 204.
 
 ### FFS-14 Containerisation and DigitalOcean deploy (P2)
+Done. Live at https://ffs-go-feature-flags-9rnac.ondigitalocean.app (App Platform, Bangalore, 1 instance, built from the repo's `Dockerfile` on `main`). Deviations from the plan above: the app is named `ffs-go-feature-flags` because the account already had an unrelated app called `feature-flag-service` (left untouched); the `.github/workflows` CI file is not on the GitHub `main` yet because the push token lacked the `workflow` scope (it is in the local history and can be added on top without rewriting anything); storage on App Platform is ephemeral and the service has no authentication, both documented in the README.
+
 - Multi-stage `Dockerfile` (distroless or alpine, non-root user, volume for `data/` and `logs/`). Use the exec form of `ENTRYPOINT` so the Go process is PID 1 and receives SIGTERM directly, which the graceful shutdown in FFS-8A depends on. Set the platform's stop timeout above `SHUTDOWN_TIMEOUT`.
 - Deploy to DigitalOcean App Platform (from GitHub) or a Droplet. Document the steps in the README and note that file storage needs a persistent volume or a later DB swap, because App Platform's filesystem is ephemeral.
 - Done when: a public `/healthz` and a working evaluate call are documented.
