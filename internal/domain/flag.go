@@ -12,6 +12,9 @@ const (
 	MaxDescriptionLength = 256
 	MaxUserIDLength      = 128
 	MaxOverridesPerFlag  = 10000
+
+	// FullRollout is the rollout percentage of a flag nobody has restricted.
+	FullRollout = 100
 )
 
 // Flag is a feature flag with a global state and optional per-user overrides.
@@ -20,13 +23,30 @@ type Flag struct {
 	Description string          `json:"description"`
 	Enabled     bool            `json:"enabled"`
 	Overrides   map[string]bool `json:"overrides,omitempty"` // user id -> enabled
-	Version     int64           `json:"version"`
-	CreatedAt   time.Time       `json:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+
+	// RolloutPercent limits an enabled flag to a share of users, chosen by a
+	// stable hash of flag name and user id. Nil means 100, so a flag that never
+	// had a rollout (every flag stored before the feature existed, and any Flag
+	// built as a literal) keeps its meaning of "on for everyone". Read it
+	// through Rollout, change it through SetRollout; the pointed-to value is
+	// never modified in place, so copies of a Flag may share it.
+	RolloutPercent *int `json:"rollout_percent,omitempty"`
+
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// FlagOption sets an optional property of a new flag.
+type FlagOption func(*Flag) error
+
+// WithRollout starts the flag at the given rollout percentage (0 to 100).
+func WithRollout(percent int) FlagOption {
+	return func(f *Flag) error { return f.SetRollout(percent) }
 }
 
 // NewFlag builds a validated flag at version 1.
-func NewFlag(name, description string, enabled bool, now time.Time) (Flag, error) {
+func NewFlag(name, description string, enabled bool, now time.Time, opts ...FlagOption) (Flag, error) {
 	f := Flag{
 		Name:        name,
 		Description: description,
@@ -34,6 +54,11 @@ func NewFlag(name, description string, enabled bool, now time.Time) (Flag, error
 		Version:     1,
 		CreatedAt:   now,
 		UpdatedAt:   now,
+	}
+	for _, opt := range opts {
+		if err := opt(&f); err != nil {
+			return Flag{}, err
+		}
 	}
 	if err := f.Validate(); err != nil {
 		return Flag{}, err
@@ -49,6 +74,11 @@ func (f Flag) Validate() error {
 	if n := utf8.RuneCountInString(f.Description); n > MaxDescriptionLength {
 		return Invalidf("description is %d characters, maximum is %d", n, MaxDescriptionLength)
 	}
+	if f.RolloutPercent != nil {
+		if err := ValidateRolloutPercent(*f.RolloutPercent); err != nil {
+			return err
+		}
+	}
 	if len(f.Overrides) > MaxOverridesPerFlag {
 		return Invalidf("flag has %d overrides, maximum is %d", len(f.Overrides), MaxOverridesPerFlag)
 	}
@@ -57,6 +87,38 @@ func (f Flag) Validate() error {
 			return err
 		}
 	}
+	return nil
+}
+
+// ValidateRolloutPercent checks that a rollout percentage is a whole number
+// from 0 to 100.
+func ValidateRolloutPercent(percent int) error {
+	if percent < 0 || percent > FullRollout {
+		return Invalidf("rollout_percent is %d, must be a whole number from 0 to %d", percent, FullRollout)
+	}
+	return nil
+}
+
+// Rollout returns the rollout percentage, 100 when none was set.
+func (f Flag) Rollout() int {
+	if f.RolloutPercent == nil {
+		return FullRollout
+	}
+	return *f.RolloutPercent
+}
+
+// SetRollout sets the rollout percentage. Setting 100 clears it, so a flag has
+// exactly one stored form for "everyone" and comparing two flags needs no
+// special case.
+func (f *Flag) SetRollout(percent int) error {
+	if err := ValidateRolloutPercent(percent); err != nil {
+		return err
+	}
+	if percent == FullRollout {
+		f.RolloutPercent = nil
+		return nil
+	}
+	f.RolloutPercent = &percent
 	return nil
 }
 
@@ -96,6 +158,10 @@ func (f *Flag) RemoveOverride(userID string) bool {
 // Clone returns a deep copy. Flag contains a map, so a plain assignment would
 // share it; DAOs, caches and audit snapshots must hold independent copies.
 func (f Flag) Clone() Flag {
+	if f.RolloutPercent != nil {
+		percent := *f.RolloutPercent
+		f.RolloutPercent = &percent
+	}
 	if f.Overrides != nil {
 		overrides := make(map[string]bool, len(f.Overrides))
 		for k, v := range f.Overrides {

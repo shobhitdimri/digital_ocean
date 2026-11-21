@@ -312,6 +312,140 @@ expect_json   "newest entry records the deletion with the final state as 'before
   '.entries[0].action == "flag.deleted" and .entries[0].after == null and .entries[0].before.enabled == false'
 expect_json   "full history is still there (7 entries)" '.entries | length == 7'
 
+section "Percentage rollout"
+RFLAG="it-rollout-${RUN_ID}"
+ROLLOUT_USERS=60
+
+# sweep FLAG ON_REASON OFF_REASON
+# Evaluates user-001 .. user-060 and sets SWEEP_ON (the enabled users, each
+# surrounded by spaces), SWEEP_COUNT, SWEEP_CACHED (answers served from the cache)
+# and SWEEP_BAD (answers that were not 200 or carried an unexpected reason).
+sweep() {
+  SWEEP_ON=" "; SWEEP_COUNT=0; SWEEP_CACHED=0; SWEEP_BAD=0
+  local i user line
+  for i in $(seq 1 "$ROLLOUT_USERS"); do
+    user="$(printf 'user-%03d' "$i")"
+    req GET "/v1/evaluate?flag=$1&user_id=${user}"
+    [ "$STATUS" = "200" ] || { SWEEP_BAD=$((SWEEP_BAD + 1)); continue; }
+    line="$(printf '%s' "$BODY" | jq -r '"\(.enabled) \(.reason) \(.source)"')"
+    case "$line" in
+      "true $2 "*)  SWEEP_ON="${SWEEP_ON}${user} "; SWEEP_COUNT=$((SWEEP_COUNT + 1)) ;;
+      "false $3 "*) ;;
+      *) SWEEP_BAD=$((SWEEP_BAD + 1)) ;;
+    esac
+    case "$line" in *" cache") SWEEP_CACHED=$((SWEEP_CACHED + 1)) ;; esac
+  done
+}
+
+# is_subset "SET_A" "SET_B": every user in A is also in B (both space separated).
+is_subset() {
+  local u
+  for u in $1; do case "$2" in *" $u "*) ;; *) return 1 ;; esac; done
+  return 0
+}
+
+req POST /v1/flags "{\"name\":\"${RFLAG}\",\"enabled\":true,\"rollout_percent\":101}"
+expect_status "creating a flag with rollout_percent 101 is rejected" 400
+expect_json   "error code is invalid_request" '.error.code == "invalid_request"'
+req GET "/v1/flags/${RFLAG}"
+expect_status "the rejected flag was not created" 404
+
+req POST /v1/flags "{\"name\":\"${RFLAG}\",\"enabled\":true,\"rollout_percent\":50}"
+expect_status "create an enabled flag at a 50% rollout" 201
+expect_json   "response reports rollout_percent 50" '.rollout_percent == 50 and .enabled == true'
+req GET "/v1/flags/${RFLAG}"
+expect_json   "reading the flag back shows rollout_percent 50" '.rollout_percent == 50'
+
+for bad in 101 -1 50.5 '"half"'; do
+  req PUT "/v1/flags/${RFLAG}" "{\"rollout_percent\":${bad}}"
+  expect_status "update with rollout_percent ${bad} is rejected" 400
+done
+req GET "/v1/flags/${RFLAG}"
+expect_json   "rejected updates left the rollout at 50 (version 1)" '.rollout_percent == 50 and .version == 1'
+
+req PUT "/v1/flags/${RFLAG}" '{"rollout_percent":0}'
+expect_status "set the rollout to 0%" 200
+expect_json   "response reports rollout_percent 0" '.rollout_percent == 0 and .enabled == true'
+sweep "$RFLAG" rollout_included rollout_excluded
+[ "$SWEEP_COUNT" -eq 0 ] && [ "$SWEEP_BAD" -eq 0 ] \
+  && pass "0%: all ${ROLLOUT_USERS} users are off with reason rollout_excluded" \
+  || fail "0%: expected nobody on, got ${SWEEP_COUNT} on and ${SWEEP_BAD} unexpected answers"
+
+req PUT "/v1/flags/${RFLAG}/overrides/user-001" '{"enabled":true}'
+expect_status "set an override for user-001 while the rollout is 0%" 200
+req GET "/v1/evaluate?flag=${RFLAG}&user_id=user-001"
+expect_json   "the override beats the rollout" '.enabled == true and .reason == "user_override"'
+req GET "/v1/evaluate?flag=${RFLAG}&user_id=user-002"
+expect_json   "other users are still excluded" '.enabled == false and .reason == "rollout_excluded"'
+req DELETE "/v1/flags/${RFLAG}/overrides/user-001"
+expect_status "remove the override" 204
+
+req PUT "/v1/flags/${RFLAG}" '{"rollout_percent":100}'
+expect_status "set the rollout to 100%" 200
+expect_json   "response reports rollout_percent 100" '.rollout_percent == 100'
+sweep "$RFLAG" global_on NONE
+[ "$SWEEP_COUNT" -eq "$ROLLOUT_USERS" ] && [ "$SWEEP_BAD" -eq 0 ] \
+  && pass "100%: all ${ROLLOUT_USERS} users are on with reason global_on" \
+  || fail "100%: expected everybody on, got ${SWEEP_COUNT} on and ${SWEEP_BAD} unexpected answers"
+
+req PUT "/v1/flags/${RFLAG}/overrides/user-001" '{"enabled":false}'
+expect_status "set an off override for user-001 while the rollout is 100%" 200
+req GET "/v1/evaluate?flag=${RFLAG}&user_id=user-001"
+expect_json   "the off override beats the rollout" '.enabled == false and .reason == "user_override"'
+req DELETE "/v1/flags/${RFLAG}/overrides/user-001"
+expect_status "remove the override again" 204
+
+req PUT "/v1/flags/${RFLAG}" '{"rollout_percent":50}'
+expect_status "set the rollout to 50%" 200
+sweep "$RFLAG" rollout_included rollout_excluded
+SET50="$SWEEP_ON"; COUNT50="$SWEEP_COUNT"
+if [ "$SWEEP_BAD" -eq 0 ] && [ "$COUNT50" -ge 5 ] && [ "$COUNT50" -le 55 ]; then
+  pass "50%: ${COUNT50} of ${ROLLOUT_USERS} users are in (expected somewhere in 5..55)"
+else
+  fail "50%: ${COUNT50} of ${ROLLOUT_USERS} users in, ${SWEEP_BAD} unexpected answers"
+fi
+
+sweep "$RFLAG" rollout_included rollout_excluded
+if [ "$SWEEP_ON" = "$SET50" ] && [ "$SWEEP_BAD" -eq 0 ]; then
+  pass "a second pass gives every user the same answer (stable assignment)"
+else
+  fail "answers changed between two passes at 50%"
+fi
+[ "$SWEEP_CACHED" -eq "$ROLLOUT_USERS" ] \
+  && pass "the second pass was served entirely from the cache" \
+  || fail "only ${SWEEP_CACHED} of ${ROLLOUT_USERS} answers came from the cache"
+
+req PUT "/v1/flags/${RFLAG}" '{"rollout_percent":80}'
+expect_status "raise the rollout to 80%" 200
+sweep "$RFLAG" rollout_included rollout_excluded
+if [ "$SWEEP_BAD" -eq 0 ] && is_subset "$SET50" "$SWEEP_ON" && [ "$SWEEP_COUNT" -ge "$COUNT50" ]; then
+  pass "raising 50% to 80% only added users (${COUNT50} -> ${SWEEP_COUNT}), nobody was swapped out"
+else
+  fail "raising the percentage removed users or gave unexpected answers (${COUNT50} -> ${SWEEP_COUNT}, bad ${SWEEP_BAD})"
+fi
+
+req PUT "/v1/flags/${RFLAG}" '{"enabled":false}'
+expect_status "disable the flag globally" 200
+expect_json   "the rollout setting is kept" '.rollout_percent == 80'
+req GET "/v1/evaluate?flag=${RFLAG}&user_id=user-001"
+expect_json   "a globally disabled flag is off whatever the rollout says" '.enabled == false and .reason == "global_off"'
+
+req GET "/v1/flags/${RFLAG}/audit"
+expect_status "read the audit trail of the rollout flag" 200
+expect_json   "creation recorded the rollout, with no previous value" \
+  '.entries[-1].action == "flag.created" and .entries[-1].before == null and .entries[-1].after.rollout_percent == 50'
+expect_json   "50 -> 0 is recorded with before and after" \
+  'any(.entries[]; .action == "flag.updated" and .before.rollout_percent == 50 and .after.rollout_percent == 0)'
+expect_json   "0 -> 100 is recorded (100 is stored as no restriction)" \
+  'any(.entries[]; .action == "flag.updated" and .before.rollout_percent == 0 and .after.rollout_percent == null)'
+expect_json   "50 -> 80 is recorded with before and after" \
+  'any(.entries[]; .action == "flag.updated" and .before.rollout_percent == 50 and .after.rollout_percent == 80)'
+expect_json   "rejected updates left no trace (rejected writes are not audited)" \
+  '[.entries[] | select(.action == "flag.updated")] | length == 5'
+
+req DELETE "/v1/flags/${RFLAG}"
+expect_status "delete the rollout flag" 204
+
 section "Persistence"
 if [ -n "$SERVER_PID" ]; then
   PERSIST="persist-${RUN_ID}"

@@ -16,7 +16,7 @@ import (
 
 // FlagCRUD is what FlagHandler needs from the flag service.
 type FlagCRUD interface {
-	Create(ctx context.Context, name, description string, enabled bool) (domain.Flag, error)
+	Create(ctx context.Context, name, description string, enabled bool, opts ...domain.FlagOption) (domain.Flag, error)
 	Get(ctx context.Context, name string) (domain.Flag, error)
 	List(ctx context.Context) ([]domain.Flag, error)
 	Update(ctx context.Context, name string, u service.FlagUpdate) (domain.Flag, error)
@@ -40,7 +40,7 @@ func (h *FlagHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	flag, err := h.flags.Create(r.Context(), req.Name, req.Description, req.Enabled)
+	flag, err := h.flags.Create(r.Context(), req.Name, req.Description, req.Enabled, req.options()...)
 	if err != nil {
 		writeError(w, r, err)
 		return

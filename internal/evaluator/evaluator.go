@@ -37,6 +37,12 @@ const (
 	ReasonUserOverride Reason = "user_override"
 	ReasonGlobalOn     Reason = "global_on"
 	ReasonGlobalOff    Reason = "global_off"
+
+	// ReasonRolloutIncluded and ReasonRolloutExcluded are reported for an
+	// enabled flag whose rollout is below 100%: the user's bucket fell inside or
+	// outside the rolled-out share.
+	ReasonRolloutIncluded Reason = "rollout_included"
+	ReasonRolloutExcluded Reason = "rollout_excluded"
 )
 
 // FlagLookup reads flags by name. It is the only capability the evaluator and

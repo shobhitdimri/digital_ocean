@@ -36,7 +36,8 @@ func sameFlag(a, b domain.Flag) bool {
 		a.Version == b.Version &&
 		a.CreatedAt.Equal(b.CreatedAt) &&
 		a.UpdatedAt.Equal(b.UpdatedAt) &&
-		reflect.DeepEqual(a.Overrides, b.Overrides)
+		reflect.DeepEqual(a.Overrides, b.Overrides) &&
+		reflect.DeepEqual(a.RolloutPercent, b.RolloutPercent)
 }
 
 func cancelled() context.Context {
@@ -229,6 +230,96 @@ func RunFlagDAOContract(t *testing.T, newDAO func(t *testing.T) dao.FlagDAO) {
 		again, _ = d.Get(ctx, "iso")
 		if !again.Overrides["alice"] {
 			t.Fatal("mutating a listed flag leaked into the store")
+		}
+	})
+
+	t.Run("rollout percentage is stored, listed and updated", func(t *testing.T) {
+		d := newDAO(t)
+		for name, pct := range map[string]int{"r0": 0, "r37": 37, "r100": 100} {
+			f, err := domain.NewFlag(name, "", true, baseTime, domain.WithRollout(pct))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.Create(ctx, f); err != nil {
+				t.Fatalf("Create %s: %v", name, err)
+			}
+			got, err := d.Get(ctx, name)
+			if err != nil || got.Rollout() != pct {
+				t.Fatalf("Get %s = rollout %d, %v; want %d", name, got.Rollout(), err, pct)
+			}
+		}
+		list, _ := d.List(ctx)
+		want := map[string]int{"r0": 0, "r37": 37, "r100": 100}
+		for _, f := range list {
+			if f.Rollout() != want[f.Name] {
+				t.Fatalf("List: %s has rollout %d, want %d", f.Name, f.Rollout(), want[f.Name])
+			}
+		}
+
+		cur, _ := d.Get(ctx, "r37")
+		next := cur.Clone()
+		if err := next.SetRollout(80); err != nil {
+			t.Fatal(err)
+		}
+		next.Version, next.UpdatedAt = 2, baseTime.Add(time.Hour)
+		if err := d.Update(ctx, next); err != nil {
+			t.Fatalf("Update to 80: %v", err)
+		}
+		if got, _ := d.Get(ctx, "r37"); !sameFlag(got, next) || got.Rollout() != 80 {
+			t.Fatalf("after raising the rollout got %+v", got)
+		}
+
+		back := next.Clone()
+		_ = back.SetRollout(100)
+		back.Version = 3
+		if err := d.Update(ctx, back); err != nil {
+			t.Fatalf("Update to 100: %v", err)
+		}
+		if got, _ := d.Get(ctx, "r37"); got.Rollout() != 100 || got.RolloutPercent != nil {
+			t.Fatalf("returning to 100%% must clear the restriction, got %+v", got.RolloutPercent)
+		}
+	})
+
+	t.Run("update with an invalid rollout is rejected and stores nothing", func(t *testing.T) {
+		d := newDAO(t)
+		f, _ := domain.NewFlag("badroll", "", true, baseTime, domain.WithRollout(20))
+		_ = d.Create(ctx, f)
+		next := f.Clone()
+		next.RolloutPercent = ptrInt(150)
+		next.Version = 2
+		if err := d.Update(ctx, next); !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("Update = %v, want ErrInvalid", err)
+		}
+		if got, _ := d.Get(ctx, "badroll"); got.Rollout() != 20 || got.Version != 1 {
+			t.Fatalf("a rejected update changed the stored flag: %+v", got)
+		}
+		bad := f.Clone()
+		bad.Name, bad.RolloutPercent = "badcreate", ptrInt(-5)
+		if err := d.Create(ctx, bad); !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("Create = %v, want ErrInvalid", err)
+		}
+	})
+
+	t.Run("stored rollout is isolated from caller mutation", func(t *testing.T) {
+		d := newDAO(t)
+		f, _ := domain.NewFlag("isoroll", "", true, baseTime, domain.WithRollout(10))
+		if err := d.Create(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+
+		*f.RolloutPercent = 99
+		if got, _ := d.Get(ctx, "isoroll"); got.Rollout() != 10 {
+			t.Fatalf("mutating the input's rollout pointer leaked into the store: %d", got.Rollout())
+		}
+		got, _ := d.Get(ctx, "isoroll")
+		*got.RolloutPercent = 99
+		if again, _ := d.Get(ctx, "isoroll"); again.Rollout() != 10 {
+			t.Fatalf("mutating a returned rollout pointer leaked into the store: %d", again.Rollout())
+		}
+		list, _ := d.List(ctx)
+		*list[0].RolloutPercent = 99
+		if again, _ := d.Get(ctx, "isoroll"); again.Rollout() != 10 {
+			t.Fatalf("mutating a listed rollout pointer leaked into the store: %d", again.Rollout())
 		}
 	})
 
@@ -458,3 +549,5 @@ func RunAuditDAOContract(t *testing.T, newDAO func(t *testing.T) dao.AuditDAO) {
 		}
 	})
 }
+
+func ptrInt(v int) *int { return &v }

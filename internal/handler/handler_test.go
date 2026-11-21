@@ -34,13 +34,26 @@ type fakeFlags struct {
 	name, desc, user string
 	enabled          bool
 	update           service.FlagUpdate
+
+	createdRollout int // rollout the Create call ended up with (100 when no option)
+	createOptions  int // how many options Create received
 }
 
 func (f *fakeFlags) record(call string) { f.calls = append(f.calls, call) }
 
-func (f *fakeFlags) Create(_ context.Context, name, desc string, enabled bool) (domain.Flag, error) {
+func (f *fakeFlags) Create(_ context.Context, name, desc string, enabled bool, opts ...domain.FlagOption) (domain.Flag, error) {
 	f.record("Create")
 	f.name, f.desc, f.enabled = name, desc, enabled
+
+	// Apply the options the way the real service does, so a test can see which
+	// rollout reached it and an invalid one is rejected before "storing".
+	applied := domain.Flag{}
+	for _, opt := range opts {
+		if err := opt(&applied); err != nil {
+			return domain.Flag{}, err
+		}
+	}
+	f.createdRollout, f.createOptions = applied.Rollout(), len(opts)
 	return f.flag, f.err
 }
 func (f *fakeFlags) Get(_ context.Context, name string) (domain.Flag, error) {
@@ -320,7 +333,7 @@ func TestCreateFlag(t *testing.T) {
 	got := decode[handler.FlagResponse](t, rec)
 	want := handler.FlagResponse{
 		Name: "new-checkout", Description: "d", Enabled: true, Overrides: map[string]bool{"u1": false},
-		Version: 3, CreatedAt: t0, UpdatedAt: t0.Add(time.Hour),
+		RolloutPercent: 100, Version: 3, CreatedAt: t0, UpdatedAt: t0.Add(time.Hour),
 	}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("body = %+v, want %+v", got, want)
@@ -970,4 +983,155 @@ type slowEvaluator struct{ delay time.Duration }
 func (s slowEvaluator) Evaluate(context.Context, string, string) (service.Evaluation, error) {
 	time.Sleep(s.delay)
 	return service.Evaluation{}, nil
+}
+
+// ---- percentage rollout ----------------------------------------------------
+
+func TestCreateFlagPassesTheRolloutToTheService(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		want    int
+		wantOpt int
+	}{
+		{"absent means no option", `{"name":"f"}`, 100, 0},
+		{"explicit 30", `{"name":"f","rollout_percent":30}`, 30, 1},
+		{"explicit 0 is a real value", `{"name":"f","rollout_percent":0}`, 0, 1},
+		{"explicit 100", `{"name":"f","rollout_percent":100}`, 100, 1},
+		{"null is the same as absent", `{"name":"f","rollout_percent":null}`, 100, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			rec := h.do("POST", "/v1/flags", tt.body)
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			if h.flags.createdRollout != tt.want || h.flags.createOptions != tt.wantOpt {
+				t.Fatalf("service got rollout %d via %d options, want %d via %d",
+					h.flags.createdRollout, h.flags.createOptions, tt.want, tt.wantOpt)
+			}
+		})
+	}
+}
+
+func TestCreateFlagWithInvalidRolloutIsABadRequest(t *testing.T) {
+	for _, pct := range []string{"-1", "101", "100000"} {
+		h := newHarness(t)
+		rec := h.do("POST", "/v1/flags", `{"name":"f","rollout_percent":`+pct+`}`)
+		if rec.Code != 400 || errorOf(t, rec).Code != "invalid_request" {
+			t.Fatalf("rollout %s: got %d %s, want 400 invalid_request", pct, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestRolloutMustBeAWholeNumber(t *testing.T) {
+	for _, bad := range []string{`12.5`, `"50"`, `true`, `[50]`, `{"v":50}`} {
+		for _, target := range []struct{ method, path, body string }{
+			{"POST", "/v1/flags", `{"name":"f","rollout_percent":` + bad + `}`},
+			{"PUT", "/v1/flags/f", `{"rollout_percent":` + bad + `}`},
+		} {
+			h := newHarness(t)
+			rec := h.do(target.method, target.path, target.body)
+			if rec.Code != 400 || errorOf(t, rec).Code != "invalid_request" {
+				t.Fatalf("%s %s: got %d %s, want 400 invalid_request", target.method, target.body, rec.Code, rec.Body.String())
+			}
+			if len(h.flags.calls) != 0 {
+				t.Fatalf("%s %s reached the service: %v", target.method, target.body, h.flags.calls)
+			}
+		}
+	}
+}
+
+func TestUpdateFlagPassesTheRolloutThrough(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want *int
+	}{
+		{"set 40", `{"rollout_percent":40}`, ptr(40)},
+		{"set 0", `{"rollout_percent":0}`, ptr(0)},
+		{"set 100", `{"rollout_percent":100}`, ptr(100)},
+		{"absent leaves it alone", `{"enabled":true}`, nil},
+		{"null leaves it alone", `{"rollout_percent":null,"enabled":true}`, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			rec := h.do("PUT", "/v1/flags/new-checkout", tt.body)
+			if rec.Code != 200 {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			got := h.flags.update.RolloutPercent
+			if (got == nil) != (tt.want == nil) || (got != nil && *got != *tt.want) {
+				t.Fatalf("rollout passed on = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateFlagMapsRolloutValidationToBadRequest(t *testing.T) {
+	h := newHarness(t)
+	h.flags.err = domain.Invalidf("rollout_percent is 101, must be a whole number from 0 to 100")
+	rec := h.do("PUT", "/v1/flags/new-checkout", `{"rollout_percent":101}`)
+	if rec.Code != 400 || errorOf(t, rec).Code != "invalid_request" {
+		t.Fatalf("got %d %s", rec.Code, rec.Body.String())
+	}
+	if msg := errorOf(t, rec).Message; !strings.Contains(msg, "rollout_percent") {
+		t.Fatalf("the message must name the field, got %q", msg)
+	}
+}
+
+func TestFlagResponsesAlwaysCarryTheRollout(t *testing.T) {
+	restricted := sampleFlag()
+	_ = restricted.SetRollout(0)
+
+	tests := []struct {
+		name   string
+		flag   domain.Flag
+		want   int
+		method string
+		path   string
+		body   string
+	}{
+		{"get unrestricted", sampleFlag(), 100, "GET", "/v1/flags/new-checkout", ""},
+		{"get at zero percent", restricted, 0, "GET", "/v1/flags/new-checkout", ""},
+		{"create at zero percent", restricted, 0, "POST", "/v1/flags", `{"name":"new-checkout","rollout_percent":0}`},
+		{"update", func() domain.Flag { f := sampleFlag(); _ = f.SetRollout(65); return f }(), 65, "PUT", "/v1/flags/new-checkout", `{"rollout_percent":65}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.flags.flag = tt.flag
+			rec := h.do(tt.method, tt.path, tt.body)
+			var raw map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("decode: %v: %s", err, rec.Body.String())
+			}
+			// Zero must not be dropped as "empty": a consumer reading 0% has to
+			// see it, not a missing field.
+			if v, ok := raw["rollout_percent"]; !ok || v != float64(tt.want) {
+				t.Fatalf("rollout_percent = %v (present=%v), want %d in %s", v, ok, tt.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestListedFlagsCarryTheirRollout(t *testing.T) {
+	h := newHarness(t)
+	half := sampleFlag()
+	half.Name = "half"
+	_ = half.SetRollout(50)
+	h.flags.list = []domain.Flag{half, sampleFlag()}
+
+	rec := h.do("GET", "/v1/flags", "")
+	var body struct {
+		Flags []handler.FlagResponse `json:"flags"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || len(body.Flags) != 2 {
+		t.Fatalf("decode: %v: %s", err, rec.Body.String())
+	}
+	if body.Flags[0].RolloutPercent != 50 || body.Flags[1].RolloutPercent != 100 {
+		t.Fatalf("rollouts = %d, %d; want 50, 100", body.Flags[0].RolloutPercent, body.Flags[1].RolloutPercent)
+	}
 }

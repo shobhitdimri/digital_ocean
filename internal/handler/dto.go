@@ -17,17 +17,28 @@ type CreateFlagRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Enabled     bool   `json:"enabled"`
+
+	// RolloutPercent is optional; leaving it out means 100.
+	RolloutPercent *int `json:"rollout_percent"`
+}
+
+func (r CreateFlagRequest) options() []domain.FlagOption {
+	if r.RolloutPercent == nil {
+		return nil
+	}
+	return []domain.FlagOption{domain.WithRollout(*r.RolloutPercent)}
 }
 
 // UpdateFlagRequest is the body of PUT /v1/flags/{name}. Omitted fields are
 // left unchanged.
 type UpdateFlagRequest struct {
-	Description *string `json:"description"`
-	Enabled     *bool   `json:"enabled"`
+	Description    *string `json:"description"`
+	Enabled        *bool   `json:"enabled"`
+	RolloutPercent *int    `json:"rollout_percent"`
 }
 
 func (r UpdateFlagRequest) toUpdate() service.FlagUpdate {
-	return service.FlagUpdate{Description: r.Description, Enabled: r.Enabled}
+	return service.FlagUpdate{Description: r.Description, Enabled: r.Enabled, RolloutPercent: r.RolloutPercent}
 }
 
 // SetOverrideRequest is the body of PUT /v1/flags/{name}/overrides/{userId}.
@@ -42,9 +53,13 @@ type FlagResponse struct {
 	Description string          `json:"description"`
 	Enabled     bool            `json:"enabled"`
 	Overrides   map[string]bool `json:"overrides"`
-	Version     int64           `json:"version"`
-	CreatedAt   time.Time       `json:"created_at"`
-	UpdatedAt   time.Time       `json:"updated_at"`
+
+	// RolloutPercent is always present, 100 for a flag with no rollout.
+	RolloutPercent int `json:"rollout_percent"`
+
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func toFlagResponse(f domain.Flag) FlagResponse {
@@ -57,9 +72,11 @@ func toFlagResponse(f domain.Flag) FlagResponse {
 		Description: f.Description,
 		Enabled:     f.Enabled,
 		Overrides:   overrides,
-		Version:     f.Version,
-		CreatedAt:   f.CreatedAt,
-		UpdatedAt:   f.UpdatedAt,
+
+		RolloutPercent: f.Rollout(),
+		Version:        f.Version,
+		CreatedAt:      f.CreatedAt,
+		UpdatedAt:      f.UpdatedAt,
 	}
 }
 

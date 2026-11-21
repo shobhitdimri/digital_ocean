@@ -16,7 +16,12 @@ var _ dao.FlagDAO = (*FlagDAO)(nil)
 
 // schemaVersion is bumped whenever the on-disk layout changes, so a newer file
 // is refused instead of being misread by an older binary.
-const schemaVersion = 1
+//
+// Version 2 added the optional rollout_percent field. Version 1 files load
+// unchanged (a flag without the field is at 100%), but a version 1 binary would
+// silently drop the field and turn every partial rollout into a full one on its
+// next write, so it must refuse a version 2 file rather than read it.
+const schemaVersion = 2
 
 type flagsFile struct {
 	SchemaVersion int           `json:"schema_version"`

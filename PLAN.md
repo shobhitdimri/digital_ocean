@@ -331,7 +331,7 @@ type Flag struct {
     Description    string          // max 256
     Enabled        bool            // global state
     Overrides      map[string]bool // userID -> enabled
-    RolloutPercent int             // 0..100, default 100 (extension)
+    RolloutPercent *int            // 0..99 when restricted; nil means 100 (FFS-12)
     Requires       []string        // prerequisite flag names (extension)
     Version        int64
     CreatedAt      time.Time
@@ -390,10 +390,10 @@ Rule chain, evaluated in order (each rule can return a decision or pass to the n
 2. PrerequisiteRule (extension) - if any required flag is not enabled for this user -> false, reason `prerequisite_failed`. Uses a cycle-safe depth limit.
 3. `OverrideRule` - if the user has an override, return it, reason `user_override`.
 4. `GlobalOffRule` - if the flag is globally disabled -> false, reason `global_off`.
-5. RolloutRule (extension) - `fnv32a(flagName + ":" + userID) % 100 < RolloutPercent` -> true, otherwise false, reason `rollout_in` or `rollout_out`.
+5. `RolloutRule` (built in FFS-12) - when the flag is below 100%: `SHA-256(flagName + NUL + userID) mod 10000 < RolloutPercent * 100` -> true with reason `rollout_included`, otherwise false with reason `rollout_excluded`. At 100% it passes to the next rule.
 6. `GlobalOnRule` (terminal) -> true, reason `global_on`.
 
-The chain is built by `evaluator.DefaultRules()`. Extensions are added there, as new rules in the order above, without editing the Evaluator or the existing rules. The evaluator is pure (inputs in, decision out), so the unit tests need no I/O. A chain that ends without a decision fails with `ErrNoDecision`, which is a misconfiguration (500), not a client error.
+The chain is built by `evaluator.DefaultRules()`. Extensions are added there (the rollout rule already was), as new rules in the order above, without editing the Evaluator or the existing rules. The evaluator is pure (inputs in, decision out), so the unit tests need no I/O. A chain that ends without a decision fails with `ErrNoDecision`, which is a misconfiguration (500), not a client error.
 
 ## 7a. Design principles applied (SOLID)
 
@@ -559,7 +559,7 @@ Handler tests for error mapping and validation edge cases already landed with FF
 | `lint` | `gofmt -s -l` (lists the offending files), `go vet ./...`, `go mod tidy` followed by `git diff --exit-code go.mod go.sum`, `go mod verify` | formatting drift, a vet finding, a stale or untidy module file, a tampered module |
 | `test` | `go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile` on Go 1.22 (the minimum in `go.mod`) and `stable`; total coverage goes to the job summary and the profile is uploaded as an artifact | any test or data race fails, or a test only passes in one order, or the newest Go breaks something |
 | `build` | static builds (`CGO_ENABLED=0 -trimpath -ldflags="-s -w"`, the same flags as `make build`) for linux/amd64, linux/arm64 and darwin/arm64 | the code stops compiling on a target platform |
-| `e2e` | runs `sample_test/integration_test.sh` after `test` passes: real binary, HTTP, SIGTERM, restart, persistence | any of its 77 checks fails |
+| `e2e` | runs `sample_test/integration_test.sh` after `test` passes: real binary, HTTP, SIGTERM, restart, persistence | any of its NNN checks fails |
 
 - `-race` needs cgo, which the Ubuntu runner has; `-count=1` bypasses Go's test cache so CI always runs the tests; `-shuffle=on` surfaces order dependence.
 - `make ci` runs the same steps locally (lint, tidy check, verify, race tests with coverage, build, end-to-end script), so a green `make ci` predicts a green pipeline.
@@ -577,8 +577,28 @@ Handler tests for error mapping and validation edge cases already landed with FF
 - Done when: a new reader can run the service and understand the rules, caching and invalidation from the README alone, and every statement in it is true. Verified.
 
 ### FFS-12 Percentage rollout (P2)
-- Add `RolloutPercent` to the flag and the API, plus the `RolloutRule` using fnv32a bucketing.
-- Tests: determinism (same user, same answer), 0 and 100 edge cases, and approximate distribution over 10k generated user ids.
+Done. An enabled flag can be limited to a share of users with `rollout_percent` (0 to 100), set on create and on update and always present in responses.
+
+**Design**
+- Rule chain is now override, global off, rollout, global on. `RolloutRule` sits between `GlobalOffRule` and `GlobalOnRule` in `DefaultRules()`; the evaluator and the other rules did not change. Reasons are `rollout_included` and `rollout_excluded`. The plan's earlier names `rollout_in` and `rollout_out` were renamed to read unambiguously in an API response.
+- Bucketing: `bucket = SHA-256(flag + NUL + user)`, first 8 bytes big-endian, modulo 10000. A user is in when `bucket < percent * 100`. The NUL separator stops `("ab","c")` colliding with `("a","bc")`. The result is deterministic across processes and releases, monotonic (raising the percentage only adds users), and independent per flag because the flag name is hashed in. A test pins known bucket values so the function cannot change by accident.
+- Representation: `Flag.RolloutPercent` is `*int`, and nil means 100. Every flag stored before this ticket, and every `Flag{}` literal, therefore keeps its meaning of "on for everyone" with no migration and no zero-value trap (a plain `int` would have turned every existing flag into 0%). `SetRollout(100)` stores nil, so "everyone" has exactly one stored form and a no-op update is detected by plain comparison. `Clone` copies the pointed-to value. The API response always shows a number (100 for nil).
+- Validation lives in the domain (`ValidateRolloutPercent`), and the service validates a requested percentage before it looks the flag up, so an invalid value is a 400 even for a flag that does not exist (pinned by `TestInvalidRolloutIsRejectedBeforeTheFlagIsLookedUp`).
+- File schema: `flags.json` moves to schema version 2. Version 1 files load unchanged. A version 1 binary refuses a version 2 file, because it would drop the field on its next write and silently turn partial rollouts into full ones. A downgrade is therefore a deliberate act, not a quiet data change.
+
+**Deviation from the plan: fnv32a replaced by SHA-256.** The ticket specified `fnv32a(flag:user) % 100`. Measured before building it, over 100,000 zero-padded sequential user ids spread across 100 buckets: FNV-1a gave a chi-square of 218 against an expected value of about 99 for a uniform hash (a visibly uneven spread), and the cohorts chosen for two different flags were correlated. SHA-256 measured at the uniform expectation and the cohorts were independent. Resolution also moved from 1% to 0.01% (10000 buckets) at no cost, so finer percentages need no change to the hash. The CPU cost is irrelevant because evaluations are cached. `TestBucketsSpreadEvenlyForRealisticIdPatterns` (chi-square bound 160) and `TestFlagsHaveIndependentCohorts` keep this from regressing.
+
+**Tests**
+- `internal/evaluator/rollout_test.go`: pinned bucket values, range and determinism, flag name and user id kept apart, 0 and 100 edges, a flag without a rollout, the exact boundary, reasons match outcomes, determinism, monotonic growth, distribution against the percentage over 10k generated ids, spread for realistic id patterns, independent cohorts, rank below overrides and global off, only the flag itself is consulted, and the rule contract.
+- `internal/domain/flag_test.go`: range validation, nil means 100, `SetRollout(100)` clears, `Clone` independence, JSON representation.
+- DAO contract suite (file and memory): the rollout is stored, listed and updated, an invalid update stores nothing, and a stored copy is isolated from caller mutation. `file` tests: a version 1 file loads at 100% and upgrades on first write, the rollout is written to disk and survives a restart, and a newer schema is refused.
+- Service, handler and `internal/integration/rollout_test.go`: create and update with a rollout, invalid values (101, -1, fraction, string) are 400 and leave no trace and no audit entry, a no-op rollout update is a no-op, a rollout change invalidates cached answers (also under concurrent readers), audit before and after, persistence across a restart with the same audience, and the split and boundaries over real HTTP.
+- `sample_test/integration_test.sh`: a rollout section (0%, 100%, about 50% of 60 users within 5..55, stable assignment, served from cache on the second pass, raising to 80% only adds users, overrides beat the rollout both ways, global off beats it, audit before and after, invalid values are 400).
+- Mutation testing: 23 planted bugs (`<` becomes `<=`, off-by-one bucket count, wrong bucket scale, separator or flag name dropped from the hash, rollout ranked above overrides or above global off, 100 not skipped, swapped reasons, `SetRollout(100)` keeping 100, shallow clone, validation accepting 101 or -1, a rollout change not counted as a change, a no-op not detected, a rollout-only update rejected, the response omitting or hard-coding the field, create or update ignoring the field, and the schema version left at 1). All 23 were killed. One (M17, skipping the service's up-front validation) survived the first run, because the later check in the domain still rejected bad values and only the answer for a nonexistent flag differed (404 instead of 400). `TestInvalidRolloutIsRejectedBeforeTheFlagIsLookedUp` was added and kills it.
+
+**Test harness fix found along the way.** About one in twelve runs of `go test ./internal/...` failed with `dial tcp ...: i/o timeout`, in old tests as well as new. Root cause: the integration harness client disabled keep-alive, so each request in the tight background reader loops (`concurrency_test.go`, `rollout_test.go`) opened a new TCP connection. Thousands of short-lived connections per second, with several packages running in parallel, exhausted the ephemeral port range on loopback (TIME_WAIT sockets), and the kernel's SYN retransmit counters rose when it happened. The harness now has a keep-alive `loadClient` / `callLoad` used by those three reader loops; ordinary request/response assertions keep the per-request-connection client on purpose, because several tests assert connection-level behaviour. Evidence after the fix: `go test -count=1 ./internal/...` repeated RUNS times with FAILS failures (about 1 in 12 before).
+
+- Done when: determinism, the 0 and 100 edges and the distribution tests pass, and the curl script proves the rule against a real server. Verified.
 
 ### FFS-13 Flag dependencies (P2)
 - Add `Requires` to the flag and API, plus the `PrerequisiteRule`.

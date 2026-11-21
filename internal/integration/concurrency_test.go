@@ -41,7 +41,7 @@ func TestConcurrentWritersAndReadersLeaveAConsistentRecord(t *testing.T) {
 					return
 				default:
 				}
-				resp := s.call("GET", fmt.Sprintf("/v1/evaluate?flag=%s&user_id=writer-%d", flag, i%writers), "", nil)
+				resp := s.callLoad("GET", fmt.Sprintf("/v1/evaluate?flag=%s&user_id=writer-%d", flag, i%writers), "", nil)
 				check(resp)
 				if resp.Status != 200 {
 					t.Errorf("evaluate = %d: %s", resp.Status, resp)
@@ -170,7 +170,7 @@ func TestAnAcknowledgedWriteIsNeverFollowedByAStaleAnswer(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					s.call("GET", "/v1/evaluate?flag="+flag+"&user_id=shared", "", nil)
+					s.callLoad("GET", "/v1/evaluate?flag="+flag+"&user_id=shared", "", nil)
 				}
 			}
 		}()

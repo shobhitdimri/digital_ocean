@@ -23,8 +23,9 @@ var ErrAuditFailed = errors.New("change applied but its audit entry could not be
 
 // FlagUpdate is a partial update. A nil field is left unchanged.
 type FlagUpdate struct {
-	Description *string
-	Enabled     *bool
+	Description    *string
+	Enabled        *bool
+	RolloutPercent *int
 }
 
 // FlagService manages flags and records an audit entry for every change.
@@ -93,8 +94,8 @@ func NewFlagService(flags dao.FlagDAO, audit dao.AuditWriter, cache Invalidator,
 
 // Create adds a new flag at version 1. It returns domain.ErrInvalid for a bad
 // name or description and domain.ErrAlreadyExists when the name is taken.
-func (s *FlagService) Create(ctx context.Context, name, description string, enabled bool) (domain.Flag, error) {
-	flag, err := domain.NewFlag(name, description, enabled, s.clock.Now())
+func (s *FlagService) Create(ctx context.Context, name, description string, enabled bool, opts ...domain.FlagOption) (domain.Flag, error) {
+	flag, err := domain.NewFlag(name, description, enabled, s.clock.Now(), opts...)
 	if err != nil {
 		return domain.Flag{}, err
 	}
@@ -135,11 +136,17 @@ func (s *FlagService) List(ctx context.Context) ([]domain.Flag, error) {
 	return s.flags.List(ctx)
 }
 
-// Update changes the description and/or global state. Setting values equal to
-// the current ones is a no-op: nothing is written and no audit entry is made.
+// Update changes the description, global state and/or rollout percentage.
+// Setting values equal to the current ones is a no-op: nothing is written and no
+// audit entry is made.
 func (s *FlagService) Update(ctx context.Context, name string, u FlagUpdate) (domain.Flag, error) {
-	if u.Description == nil && u.Enabled == nil {
-		return domain.Flag{}, domain.Invalidf("nothing to update: provide description and/or enabled")
+	if u.Description == nil && u.Enabled == nil && u.RolloutPercent == nil {
+		return domain.Flag{}, domain.Invalidf("nothing to update: provide description, enabled and/or rollout_percent")
+	}
+	if u.RolloutPercent != nil {
+		if err := domain.ValidateRolloutPercent(*u.RolloutPercent); err != nil {
+			return domain.Flag{}, err
+		}
 	}
 	return s.mutate(ctx, name, domain.ActionFlagUpdated, func(f *domain.Flag) (bool, error) {
 		changed := false
@@ -149,6 +156,12 @@ func (s *FlagService) Update(ctx context.Context, name string, u FlagUpdate) (do
 		}
 		if u.Enabled != nil && *u.Enabled != f.Enabled {
 			f.Enabled = *u.Enabled
+			changed = true
+		}
+		if u.RolloutPercent != nil && *u.RolloutPercent != f.Rollout() {
+			if err := f.SetRollout(*u.RolloutPercent); err != nil {
+				return false, err
+			}
 			changed = true
 		}
 		return changed, nil

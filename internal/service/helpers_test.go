@@ -64,6 +64,13 @@ func (s *spyInvalidator) Tags() []string {
 	return append([]string(nil), s.tags...)
 }
 
+// Reset forgets the tags seen so far, so a test can look at one step in isolation.
+func (s *spyInvalidator) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tags = nil
+}
+
 // hookDAO wraps a FlagDAO to count calls and to replace Update with a test
 // controlled behaviour.
 type hookDAO struct {

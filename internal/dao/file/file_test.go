@@ -112,7 +112,7 @@ func TestFlagFileFormatAndNoTempLeftovers(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("file is not valid JSON: %v", err)
 	}
-	if doc.SchemaVersion != 1 || len(doc.Flags) != 2 || doc.Flags[0].Name != "a" || doc.Flags[1].Name != "b" {
+	if doc.SchemaVersion != 2 || len(doc.Flags) != 2 || doc.Flags[0].Name != "a" || doc.Flags[1].Name != "b" {
 		t.Fatalf("unexpected file contents: %s", raw)
 	}
 
@@ -135,6 +135,10 @@ func TestFlagStoreStartupValidation(t *testing.T) {
 		{"corrupt json", `{"schema_version": 1, "flags": [`, "corrupt"},
 		{"newer schema", `{"schema_version": 99, "flags": []}`, "schema version 99"},
 		{"invalid flag", `{"schema_version":1,"flags":[{"name":"bad name","version":1}]}`, "invalid flag"},
+		{"rollout over 100", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":101}]}`, "invalid flag"},
+		{"negative rollout", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":-1}]}`, "invalid flag"},
+		{"fractional rollout", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":12.5}]}`, "corrupt"},
+		{"next schema", `{"schema_version": 3, "flags": []}`, "schema version 3"},
 		{"duplicate names", `{"schema_version":1,"flags":[{"name":"x","version":1},{"name":"x","version":1}]}`, "duplicate"},
 	}
 	for _, tc := range tests {
@@ -337,5 +341,87 @@ func TestAuditMissingFileListsEmpty(t *testing.T) {
 	got, err := d.ListByFlag(ctx, "a", 0)
 	if err != nil || got == nil || len(got) != 0 {
 		t.Fatalf("got %v, %v; want empty non-nil", got, err)
+	}
+}
+
+// Files written before rollouts existed (schema 1, no rollout field) must load
+// unchanged and mean "on for everyone".
+func TestSchemaOneFileLoadsAsFullRolloutAndUpgradesOnFirstWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.json")
+	v1 := `{"schema_version":1,"flags":[{"name":"legacy","description":"old","enabled":true,"version":4,` +
+		`"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}]}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := NewFlagDAO(path)
+	if err != nil {
+		t.Fatalf("a schema 1 file must still load: %v", err)
+	}
+	got, err := d.Get(ctx, "legacy")
+	if err != nil || got.Rollout() != 100 || got.RolloutPercent != nil || got.Version != 4 {
+		t.Fatalf("legacy flag = %+v, %v", got, err)
+	}
+	if after, _ := os.ReadFile(path); string(after) != v1 {
+		t.Fatal("loading must not rewrite the file")
+	}
+
+	next := got.Clone()
+	next.Description, next.Version = "touched", 5
+	if err := d.Update(ctx, next); err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		SchemaVersion int `json:"schema_version"`
+	}
+	raw, _ := os.ReadFile(path)
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.SchemaVersion != 2 {
+		t.Fatalf("after a write the file must be schema 2 (%v): %s", err, raw)
+	}
+}
+
+func TestRolloutIsWrittenToDiskAndSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.json")
+	d1, err := NewFlagDAO(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, pct := range map[string]int{"zero": 0, "half": 50, "all": 100} {
+		f, err := domain.NewFlag(name, "", true, time.Now().UTC(), domain.WithRollout(pct))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d1.Create(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var doc struct {
+		Flags []map[string]any `json:"flags"`
+	}
+	raw, _ := os.ReadFile(path)
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	onDisk := map[string]map[string]any{}
+	for _, f := range doc.Flags {
+		onDisk[f["name"].(string)] = f
+	}
+	if onDisk["zero"]["rollout_percent"] != float64(0) || onDisk["half"]["rollout_percent"] != float64(50) {
+		t.Fatalf("rollouts missing from the file: %v", onDisk)
+	}
+	if v, present := onDisk["all"]["rollout_percent"]; present {
+		t.Fatalf("an unrestricted flag should not write rollout_percent, got %v", v)
+	}
+
+	d2, err := NewFlagDAO(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]int{"zero": 0, "half": 50, "all": 100} {
+		got, err := d2.Get(ctx, name)
+		if err != nil || got.Rollout() != want {
+			t.Fatalf("after restart %s = %d, %v; want %d", name, got.Rollout(), err, want)
+		}
 	}
 }

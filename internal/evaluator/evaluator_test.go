@@ -235,7 +235,7 @@ func TestDefaultRuleOrder(t *testing.T) {
 	for _, r := range evaluator.DefaultRules() {
 		names = append(names, r.Name())
 	}
-	if !reflect.DeepEqual(names, []string{"override", "global_off", "global_on"}) {
+	if !reflect.DeepEqual(names, []string{"override", "global_off", "rollout", "global_on"}) {
 		t.Fatalf("default chain = %v", names)
 	}
 }

@@ -105,6 +105,21 @@ var client = &http.Client{
 	Transport: &http.Transport{DisableKeepAlives: true},
 }
 
+// loadClient is for background goroutines that send requests in a tight loop.
+// Opening a connection per request, as client does, burns thousands of
+// ephemeral ports a second; with the packages' tests running in parallel the
+// port range fills with TIME_WAIT sockets and the kernel starts dropping SYNs,
+// which shows up as "dial tcp: i/o timeout" in unrelated tests. Reusing a few
+// connections keeps the load while leaving the ports alone.
+var loadClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 16,
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
+
 // response is a received HTTP response with its body already read.
 type response struct {
 	Status int
@@ -131,7 +146,9 @@ type flagBody struct {
 	Description string          `json:"description"`
 	Enabled     bool            `json:"enabled"`
 	Overrides   map[string]bool `json:"overrides"`
-	Version     int64           `json:"version"`
+	// A pointer so a missing field is distinguishable from 0.
+	RolloutPercent *int  `json:"rollout_percent"`
+	Version        int64 `json:"version"`
 }
 
 type evalBody struct {
@@ -170,6 +187,17 @@ type errorBody struct {
 // no X-Actor header. extra is alternating header names and values.
 func (s *server) call(method, path, actor string, body any, extra ...string) response {
 	s.t.Helper()
+	return s.send(client, method, path, actor, body, extra...)
+}
+
+// callLoad is call over loadClient, for background loops.
+func (s *server) callLoad(method, path, actor string, body any, extra ...string) response {
+	s.t.Helper()
+	return s.send(loadClient, method, path, actor, body, extra...)
+}
+
+func (s *server) send(c *http.Client, method, path, actor string, body any, extra ...string) response {
+	s.t.Helper()
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -191,7 +219,7 @@ func (s *server) call(method, path, actor string, body any, extra ...string) res
 	for i := 0; i+1 < len(extra); i += 2 {
 		req.Header.Set(extra[i], extra[i+1])
 	}
-	resp, err := client.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		s.t.Fatalf("%s %s: %v", method, path, err)
 	}

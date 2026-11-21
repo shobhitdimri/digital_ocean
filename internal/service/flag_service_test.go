@@ -877,3 +877,244 @@ func TestProductionClockAndIDGenerator(t *testing.T) {
 		seen[id] = struct{}{}
 	}
 }
+
+// ---- percentage rollout ----------------------------------------------------
+
+func TestCreateWithRollout(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("alice", "req-1")
+
+	got, err := f.svc.Create(ctx, "gradual", "d", true, domain.WithRollout(25))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Rollout() != 25 {
+		t.Fatalf("created flag rollout = %d, want 25", got.Rollout())
+	}
+	stored, _ := f.flags.Get(ctx, "gradual")
+	if stored.Rollout() != 25 {
+		t.Fatalf("stored rollout = %d, want 25", stored.Rollout())
+	}
+	h := f.history(t, "gradual")
+	if len(h) != 1 {
+		t.Fatalf("got %d audit entries", len(h))
+	}
+	if after := decodeFlag(t, h[0].After); after == nil || after.Rollout() != 25 {
+		t.Fatalf("the audit trail must record the starting rollout: %s", h[0].After)
+	}
+}
+
+func TestCreateWithoutRolloutIsFullyRolledOut(t *testing.T) {
+	f := newFixture(t)
+	got, err := f.svc.Create(reqCtx("a", "r"), "plain", "", true)
+	if err != nil || got.Rollout() != 100 || got.RolloutPercent != nil {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+}
+
+func TestCreateWithInvalidRolloutLeavesNoTrace(t *testing.T) {
+	for _, pct := range []int{-1, 101, 1000} {
+		f := newFixture(t)
+		_, err := f.svc.Create(reqCtx("a", "r"), "bad", "", true, domain.WithRollout(pct))
+		if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("rollout %d: err = %v, want ErrInvalid", pct, err)
+		}
+		if all, _ := f.flags.List(context.Background()); len(all) != 0 {
+			t.Fatalf("rollout %d stored %v", pct, all)
+		}
+		if len(f.cache.Tags()) != 0 || len(f.history(t, "bad")) != 0 {
+			t.Fatalf("rollout %d left cache or audit side effects", pct)
+		}
+	}
+}
+
+func TestUpdateChangesTheRolloutAndRecordsBeforeAndAfter(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("alice", "r0"), "gradual", "d", true, domain.WithRollout(10))
+
+	got, err := f.svc.Update(reqCtx("bob", "r1"), "gradual", service.FlagUpdate{RolloutPercent: ptr(60)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Rollout() != 60 || got.Version != 2 || !got.Enabled || got.Description != "d" {
+		t.Fatalf("got %+v: only the rollout should have changed", got)
+	}
+
+	h := f.history(t, "gradual")
+	if len(h) != 2 {
+		t.Fatalf("got %d entries, want 2", len(h))
+	}
+	e := h[1]
+	if e.Actor != "bob" || e.Action != domain.ActionFlagUpdated {
+		t.Fatalf("entry = %+v", e)
+	}
+	if before := decodeFlag(t, e.Before); before == nil || before.Rollout() != 10 {
+		t.Fatalf("before = %s, want rollout 10", e.Before)
+	}
+	if after := decodeFlag(t, e.After); after == nil || after.Rollout() != 60 {
+		t.Fatalf("after = %s, want rollout 60", e.After)
+	}
+}
+
+// The rollout decides what users see, so changing it must drop cached answers.
+func TestRolloutChangeInvalidatesCachedEvaluations(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("a", "r"), "gradual", "", true, domain.WithRollout(10))
+	f.cache.Reset()
+
+	if _, err := f.svc.Update(reqCtx("a", "r2"), "gradual", service.FlagUpdate{RolloutPercent: ptr(20)}); err != nil {
+		t.Fatal(err)
+	}
+	if tags := f.cache.Tags(); len(tags) != 1 || tags[0] != "flag:gradual" {
+		t.Fatalf("invalidated %v, want exactly flag:gradual", tags)
+	}
+}
+
+func TestRolloutUpdateToTheSameValueIsANoOp(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("a", "r"), "gradual", "", true, domain.WithRollout(30))
+	f.cache.Reset()
+
+	got, err := f.svc.Update(reqCtx("a", "r2"), "gradual", service.FlagUpdate{RolloutPercent: ptr(30)})
+	if err != nil || got.Version != 1 {
+		t.Fatalf("got version %d, %v: setting the same rollout must not write", got.Version, err)
+	}
+	if len(f.history(t, "gradual")) != 1 || len(f.cache.Tags()) != 0 || f.hookDAO.updateCalls.Load() != 0 {
+		t.Fatal("a no-op rollout update had side effects")
+	}
+}
+
+// 100 and "never set" are the same state, so asking for 100 on a flag that
+// was never restricted must not create a version or an audit entry.
+func TestSettingFullRolloutOnAnUnrestrictedFlagIsANoOp(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("a", "r"), "plain", "", true)
+	f.cache.Reset()
+
+	got, err := f.svc.Update(reqCtx("a", "r2"), "plain", service.FlagUpdate{RolloutPercent: ptr(100)})
+	if err != nil || got.Version != 1 {
+		t.Fatalf("got version %d, %v", got.Version, err)
+	}
+	if len(f.history(t, "plain")) != 1 || len(f.cache.Tags()) != 0 {
+		t.Fatal("asking for 100%% on an unrestricted flag had side effects")
+	}
+}
+
+func TestRolloutCanGoToZeroAndBackToFull(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "kill", "", true)
+
+	got, err := f.svc.Update(ctx, "kill", service.FlagUpdate{RolloutPercent: ptr(0)})
+	if err != nil || got.Rollout() != 0 || got.Version != 2 {
+		t.Fatalf("to 0: %+v, %v", got, err)
+	}
+	got, err = f.svc.Update(ctx, "kill", service.FlagUpdate{RolloutPercent: ptr(100)})
+	if err != nil || got.Rollout() != 100 || got.RolloutPercent != nil || got.Version != 3 {
+		t.Fatalf("back to 100: %+v, %v", got, err)
+	}
+}
+
+func TestUpdateRejectsInvalidRolloutAndChangesNothing(t *testing.T) {
+	for _, pct := range []int{-1, 101, 250} {
+		f := newFixture(t)
+		ctx := reqCtx("a", "r")
+		f.svc.Create(ctx, "f", "d", true, domain.WithRollout(40))
+		f.cache.Reset()
+
+		_, err := f.svc.Update(ctx, "f", service.FlagUpdate{RolloutPercent: ptr(pct), Description: ptr("also changed")})
+		if !errors.Is(err, domain.ErrInvalid) {
+			t.Fatalf("rollout %d: err = %v, want ErrInvalid", pct, err)
+		}
+		got, _ := f.flags.Get(ctx, "f")
+		if got.Rollout() != 40 || got.Description != "d" || got.Version != 1 {
+			t.Fatalf("rollout %d: a rejected update still changed the flag: %+v", pct, got)
+		}
+		if len(f.history(t, "f")) != 1 || len(f.cache.Tags()) != 0 {
+			t.Fatalf("rollout %d left audit or cache side effects", pct)
+		}
+	}
+}
+
+func TestRolloutAloneIsEnoughForAnUpdate(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("a", "r"), "f", "d", true)
+	if _, err := f.svc.Update(reqCtx("a", "r2"), "f", service.FlagUpdate{}); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("an empty update must stay invalid, got %v", err)
+	}
+	if _, err := f.svc.Update(reqCtx("a", "r3"), "f", service.FlagUpdate{RolloutPercent: ptr(5)}); err != nil {
+		t.Fatalf("an update carrying only a rollout must be accepted: %v", err)
+	}
+}
+
+func TestRolloutAndEnabledChangeTogetherAsOneVersion(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "f", "d", false)
+
+	got, err := f.svc.Update(ctx, "f", service.FlagUpdate{Enabled: ptr(true), RolloutPercent: ptr(5)})
+	if err != nil || got.Version != 2 || !got.Enabled || got.Rollout() != 5 {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	if h := f.history(t, "f"); len(h) != 2 {
+		t.Fatalf("one update must be one audit entry, got %d entries in total", len(h))
+	}
+}
+
+func TestOverrideChangesKeepTheRollout(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "f", "d", true, domain.WithRollout(15))
+
+	got, err := f.svc.SetOverride(ctx, "f", "vip", true)
+	if err != nil || got.Rollout() != 15 {
+		t.Fatalf("setting an override changed the rollout: %+v, %v", got, err)
+	}
+	got, err = f.svc.RemoveOverride(ctx, "f", "vip")
+	if err != nil || got.Rollout() != 15 {
+		t.Fatalf("removing an override changed the rollout: %+v, %v", got, err)
+	}
+}
+
+func TestConcurrentRolloutUpdatesNeverLoseAVersion(t *testing.T) {
+	f := newFixture(t)
+	f.svc.Create(reqCtx("a", "r"), "ramp", "", true, domain.WithRollout(0))
+
+	const workers = 16
+	var wg sync.WaitGroup
+	for w := 1; w <= workers; w++ {
+		wg.Add(1)
+		go func(pct int) {
+			defer wg.Done()
+			if _, err := f.svc.Update(reqCtx("w", fmt.Sprintf("r%d", pct)), "ramp", service.FlagUpdate{RolloutPercent: ptr(pct)}); err != nil {
+				t.Errorf("update to %d: %v", pct, err)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	got, _ := f.flags.Get(context.Background(), "ramp")
+	if got.Version != workers+1 {
+		t.Fatalf("version = %d, want %d: a concurrent update was lost or doubled", got.Version, workers+1)
+	}
+	if h := f.history(t, "ramp"); len(h) != workers+1 {
+		t.Fatalf("%d audit entries, want %d", len(h), workers+1)
+	}
+}
+
+// Bad input is reported as bad input whether or not the flag exists, and
+// without taking the flag's lock or touching the store.
+func TestInvalidRolloutIsRejectedBeforeTheFlagIsLookedUp(t *testing.T) {
+	f := newFixture(t)
+	_, err := f.svc.Update(reqCtx("a", "r"), "does-not-exist", service.FlagUpdate{RolloutPercent: ptr(101)})
+	if !errors.Is(err, domain.ErrInvalid) || errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrInvalid and not ErrNotFound", err)
+	}
+	if f.hookDAO.updateCalls.Load() != 0 {
+		t.Fatal("an invalid request reached the store")
+	}
+
+	if _, err := f.svc.Update(reqCtx("a", "r"), "does-not-exist", service.FlagUpdate{RolloutPercent: ptr(50)}); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("a valid rollout on a missing flag = %v, want ErrNotFound", err)
+	}
+}
