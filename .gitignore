@@ -1,0 +1,21 @@
+# Binaries
+/bin/
+*.exe
+*.test
+*.out
+
+# Runtime data and logs
+/data/*
+!/data/.gitkeep
+/logs/*
+!/logs/.gitkeep
+
+# Environment
+.env
+.env.*
+
+# Tooling
+.idea/
+.vscode/
+.DS_Store
+coverage.out
