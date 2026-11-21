@@ -111,7 +111,7 @@ sequenceDiagram
     H-->>C: 200 enabled, reason, source
 ```
 
-Cache bypass cases: a miss, an expired TTL, an invalidated tag, or the request header `Cache-Control: no-cache` (debug aid, logged at debug level). Not-found results are never cached, so a newly created flag is visible immediately.
+Cache bypass cases: a miss, an expired TTL, or an invalidated tag. (An earlier sketch also had a `Cache-Control: no-cache` debug header; it was never built and is not part of the service.) Not-found results are never cached, so a newly created flag is visible immediately.
 
 ### 2.3 Write path and cache invalidation
 
@@ -375,7 +375,7 @@ Conventions:
 ## 6. Logging design (`pkg/logger`)
 
 - Built on `log/slog` with a JSON handler. Output goes to `logs/app.log` and stdout, and records at warn and above also go to `logs/error.log`.
-- Levels: DEBUG (cache hit or miss detail, rule decisions, DAO calls), INFO (request completed, flag changed, startup and shutdown), WARN (validation failures, 4xx, cache bypass, slow requests), ERROR (5xx, DAO failures, panics with stack).
+- Levels: DEBUG (cache hit and miss detail; health probes), INFO (request completed, startup and shutdown), WARN (4xx responses, slow requests), ERROR (5xx, failed audit writes, panics with stack). Client mistakes are warnings so an error-level record always means a server fault.
 - Level is controlled by `LOG_LEVEL`, with `info` as the production default.
 - Every request log line carries: `time`, `level`, `request_id`, `actor` (user name from `X-Actor`, or `anonymous`), `method`, `path`, `status`, `duration_ms`, `remote_addr`, and `user_id` for evaluate calls.
 - Request-scoped logger: the middleware builds a child logger with `request_id` and `actor` and stores it in the context. Services and DAOs call `logger.FromContext(ctx)`, so the whole trace of a user request is correlated by `request_id`.
@@ -569,7 +569,12 @@ Handler tests for error mapping and validation edge cases already landed with FF
 - Done when: the workflow is lint-clean and every step passes locally. Both verified; the first real run happens when the repository is pushed to GitHub (deferred).
 
 ### FFS-11 Documentation (P1)
-- README: overview, setup and run, configuration table, API reference with curl examples, evaluation rules, caching (LFU choice, key format, tags, TTL, invalidation strategy, multi-instance caveat), logging, audit trail, project layout, the architecture diagrams from section 2, testing, and future work.
+`README.md` covers: what the service is and what is not built yet; quick start with a copy-paste curl session; the evaluation rules (override, global off, global on) with the reason each returns; caching (what is cached, key and tag format, why LFU with a TTL, capacity and eviction, the janitor, when the cache is consulted, bypassed and invalidated, the invalidation strategy including the stale-fill epoch protocol and the multi-instance caveat); the architecture diagram, the evaluation path diagram showing where the cache sits, the write and invalidation path, and the lifecycle diagram; the full API reference with conventions, every error code and the exact response shapes; the audit trail; logging; the configuration table; storage and durability; the concurrency model; graceful shutdown including `SHUTDOWN_DELAY` behind a load balancer; testing and CI; the project layout; and the roadmap.
+
+- Written only from verified behaviour. Planned work (percentage rollout, dependencies, deployment) is under the Roadmap and nowhere presented as built.
+- Verification: the quick-start commands were executed literally and all five evaluation outputs shown in the README match the real server exactly; every error code in the error table was provoked against a running server; the configuration table matches `config.go` in both directions (no variable missing either way, defaults checked); all four mermaid diagrams parse with the real mermaid parser (which was shown to reject broken input); all 20 in-page links resolve; every file path and `make` target mentioned exists.
+- Corrections this exposed: the README first omitted the 413 `body_too_large`, 415 `unsupported_media_type` and 499 codes, and claimed debug logs include rule decisions (they do not). This plan had the same kind of drift, so section 2.2 no longer lists a `Cache-Control: no-cache` bypass (never built) and section 6 now lists only the log levels that exist.
+- Done when: a new reader can run the service and understand the rules, caching and invalidation from the README alone, and every statement in it is true. Verified.
 
 ### FFS-12 Percentage rollout (P2)
 - Add `RolloutPercent` to the flag and the API, plus the `RolloutRule` using fnv32a bucketing.
