@@ -4,19 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 )
 
 // Run starts the HTTP server and blocks until ctx is cancelled or the server
 // fails. On cancellation it drains in-flight requests before returning.
 //
-// This is the bare version from FFS-1; readiness handling, ordered closers and
-// structured logging arrive in FFS-2 and FFS-8A.
+// Readiness handling and shutdown tests arrive in FFS-8A.
 func (a *App) Run(ctx context.Context) error {
+	a.log.Info("starting server",
+		"addr", a.srv.Addr,
+		"log_level", a.cfg.LogLevel,
+		"data_dir", a.cfg.DataDir,
+		"cache_capacity", a.cfg.CacheCapacity,
+		"cache_ttl", a.cfg.CacheTTL.String(),
+	)
+
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("server listening on %s", a.srv.Addr)
 		if err := a.srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -24,16 +29,27 @@ func (a *App) Run(ctx context.Context) error {
 
 	select {
 	case err := <-errCh:
+		a.log.Error("server failed", "err", err)
+		_ = a.closeAll()
 		return fmt.Errorf("server failed: %w", err)
 	case <-ctx.Done():
 	}
 
-	log.Println("shutdown signal received")
+	a.log.Info("shutdown signal received", "timeout", a.cfg.ShutdownTimeout.String())
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ShutdownTimeout)
 	defer cancel()
-	if err := a.srv.Shutdown(shutdownCtx); err != nil {
+
+	shutdownErr := a.srv.Shutdown(shutdownCtx)
+	if shutdownErr != nil {
+		a.log.Warn("graceful shutdown did not finish, forcing close", "err", shutdownErr)
 		_ = a.srv.Close()
-		return fmt.Errorf("graceful shutdown: %w", err)
+		shutdownErr = fmt.Errorf("graceful shutdown: %w", shutdownErr)
+	} else {
+		a.log.Info("server stopped cleanly")
 	}
-	return nil
+
+	if err := a.closeAll(); err != nil && shutdownErr == nil {
+		return fmt.Errorf("close resources: %w", err)
+	}
+	return shutdownErr
 }
