@@ -207,8 +207,11 @@ feature-flag-service/
       evaluator.go             # Evaluator + Rule interface, result type
       rules.go                 # PrerequisiteRule, OverrideRule, GlobalRule, RolloutRule
     service/
+      ports.go                 # consumer-defined interfaces: Clock, IDGenerator, Invalidator, EvalCache, FlagEvaluator
       flag_service.go          # CRUD, overrides, audit, invalidation
       evaluation_service.go    # cache-aside evaluation
+      audit_service.go         # read-only audit history
+      keyedlock.go             # per-flag lock that honours context cancellation
     handler/
       flag_handler.go
       evaluate_handler.go
@@ -470,11 +473,16 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 - Required unit tests: global on, global off, override on over global off, override off over global on, user without an override uses global, and flag not found. Plus: invalid input, cancelled context, storage errors not mistaken for not-found, a new rule inserted without changing the evaluator, first deciding rule wins, no-terminal-rule error, rule errors keep their sentinel, consulted-flag tracking, the rule contract for every default rule, and a concurrent evaluation test under `-race`.
 
 ### FFS-7 Services (P0)
-- `FlagService`: create, get, list, update, delete, set or remove override. Each write builds before and after snapshots, writes via the DAO, appends the audit entry (actor, time, before, after, request id), then invalidates the cache tag.
-- `EvaluationService`: cache-aside using key `eval:{flag}:{user}`, tagged with the flag and consulted prerequisites, and no caching of errors. On a miss it must follow the epoch protocol from FFS-5 to avoid caching a stale result: read `cache.Epoch()` first, then read the flag and evaluate, then store with `cache.SetIfEpoch(...)`. The result is still returned to the caller when the store is refused.
-- Interfaces and dependency injection (SOLID): the services declare the narrow interfaces they consume instead of importing concrete or wide types. `EvaluationService` takes `dao.FlagReader`, a cache interface with only `Get`, `Epoch` and `SetIfEpoch`, and a `Clock`. `FlagService` takes `dao.FlagDAO`, `dao.AuditWriter`, a cache interface with only `InvalidateTag`, a `Clock`, and an `IDGenerator` for audit ids. `Clock` and `IDGenerator` are one-method interfaces with fakes for deterministic tests.
-- Writes retry on `domain.ErrConflict` (optimistic version check from FFS-4) a small bounded number of times, then return 409.
-- Unit tests with the in-memory DAOs and a spy cache: a write invalidates, a hit skips the DAO, and audit entries have correct before and after values.
+- `FlagService`: create, get, list, update (partial), delete, set or remove override. Every write follows one order: take the per-flag lock, read, build the next version, store through the DAO (optimistic version check), invalidate `FlagTag(name)`, then append the audit entry (actor, time, before, after, request id).
+  - Invalidation comes before the audit append to keep the stale window short. Both run on `context.WithoutCancel(ctx)`, so a client disconnecting after the commit cannot leave a stale cache or a missing audit entry.
+  - A per-flag lock (channel based, so a waiting request still honours its context deadline) serialises writers of one flag and keeps audit order identical to version order. Writes to different flags run in parallel. The optimistic retry on `domain.ErrConflict` (at most 3 attempts, then 409) remains for changes made outside this process.
+  - Updates that change nothing are no-ops: no write, no version bump, no audit entry, no invalidation.
+  - If the audit append fails after the change was committed, the change is not rolled back. The full entry is logged at error level and the caller gets `ErrAuditFailed` (a 500), so the failure is never silent.
+- `EvaluationService`: cache-aside using key `eval:{flag}:{user}` (flag names cannot contain `:`, so keys are unambiguous), tagged with `FlagTag` for every flag the evaluation consulted. Input is validated before the cache is touched. On a miss it follows the epoch protocol: read `cache.Epoch()`, evaluate, store with `cache.SetIfEpoch(...)`; the result is returned even when the store is refused. Errors, including not-found, are never cached, so probing random names cannot fill the cache.
+- `AuditService`: newest-first history, depends only on `dao.AuditReader`. A zero limit uses the default (50), a negative limit is invalid, a limit above 1000 is capped, and a deleted or unknown flag returns an empty list rather than 404.
+- Interfaces and dependency injection (SOLID), all declared in `service/ports.go` by the consumer: `Clock`, `IDGenerator`, `Invalidator` (only `InvalidateTag`), `EvalCache` (only `Get`, `Epoch`, `SetIfEpoch`) and `FlagEvaluator` (only `Evaluate`). `FlagService` takes `dao.FlagDAO`, `dao.AuditWriter` and an `Invalidator`. `EvaluationService` takes a `FlagEvaluator` and an `EvalCache`, so it never sees a DAO. The real clock and ID generator are the defaults; tests inject fakes.
+- Lock order is service lock, then DAO and cache locks. Neither the DAOs nor the cache call back into the service, so no cycle exists. The actor and request id come from the request context (set by the FFS-8 middleware); a missing actor is recorded as `anonymous`.
+- Tests: audit contents (before, after, actor, request id, time) for every action; invalidation and audit ordering; conflict retry using fresh data; bounded retry exhaustion; storage and audit failures; cancellation after commit; lock waits that honour deadlines; 40 concurrent writers to one flag losing no updates with audit order equal to version order; a concurrent mixed-operation run whose audit trail replays to the stored state; deterministic stale-fill refusal; and a read-your-writes test under `-race` with readers racing a writer that toggles a flag.
 
 ### FFS-8 HTTP layer (P0)
 - `router` with Go 1.22 patterns, middleware chain (recover -> request id -> actor -> logging -> body limit), handlers, DTOs, `httpx` response and error mapping.
