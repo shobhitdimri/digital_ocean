@@ -95,6 +95,7 @@ sequenceDiagram
         K-->>E: cached result
         E-->>H: result with source=cache
     else cache miss or expired
+        E->>K: Epoch() snapshot before reading the source
         E->>D: Get(X)
         alt flag not found
             D-->>E: ErrNotFound
@@ -103,7 +104,7 @@ sequenceDiagram
         else flag found
             E->>R: Evaluate(flag, user, flag reader)
             R-->>E: enabled, reason, flags consulted
-            E->>K: Set(eval:X:U, result, ttl, tags = X plus prerequisites)
+            E->>K: SetIfEpoch(eval:X:U, result, ttl, epoch, tags = X plus prerequisites)
             E-->>H: result with source=store
         end
     end
@@ -141,6 +142,7 @@ Invalidation strategy (to be explained in the README):
 3. Per-user override changes invalidate the whole flag tag (simple and correct). A finer key delete `eval:X:U` is a possible optimisation.
 4. TTL (default 60s) bounds staleness if anything is missed. This also covers the multi-instance case until Redis or pub/sub is added.
 5. Delete invalidates the tag too, and deleting a flag that other flags require returns 409.
+6. Stale-fill protection. Without it, a reader that loaded the old flag could store its result after a writer's invalidation and keep serving it until the TTL. Readers therefore snapshot `Epoch()` before reading the source and store with `SetIfEpoch`, which is refused if any invalidation happened in between. The epoch advances even when the invalidated tag has no entries, because the writer's change may predate any cached entry.
 
 ### 2.4 Process lifecycle: startup, janitor, and graceful shutdown
 
@@ -275,6 +277,8 @@ type AuditDAO interface {
 type Cache interface {
     Get(key string) (any, bool)
     Set(key string, value any, ttl time.Duration, tags ...string)
+    Epoch() uint64 // advances on every Delete and InvalidateTag, even when nothing was removed
+    SetIfEpoch(key string, value any, ttl time.Duration, epoch uint64, tags ...string) bool // stale-fill guard
     Delete(key string)
     InvalidateTag(tag string)
 }
@@ -287,7 +291,7 @@ type Config struct {
     SweepBatchSize  int           // entries scanned per lock hold, so the sweep never blocks readers for long
     Clock           func() time.Time // injectable for tests
 }
-func New(cfg Config, log *slog.Logger) *Cache
+func New(cfg Config, log *slog.Logger) (*Cache, error) // error when Capacity < 1 or JanitorInterval < 0
 func (c *Cache) SweepNow() int // removes expired entries, returns count (used by janitor and tests)
 func (c *Cache) Close() error  // idempotent (sync.Once): stops the ticker, waits for the goroutine
 
@@ -430,10 +434,11 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 - `pkg/cache` interface and `pkg/cache/lfu`: O(1) get and set via frequency buckets and a doubly linked list, capacity eviction, per-entry TTL with lazy expiry on `Get`, tag index with `InvalidateTag`, and thread safety.
 - TTL janitor (`janitor.go`): a background goroutine started by `lfu.New` when `JanitorInterval > 0`.
   - Why: lazy expiry alone leaves entries that are never read again in memory until LFU evicts them, and a stale low-frequency entry may sit a long time.
-  - How: `time.Ticker` loop with `select` on `ticker.C` and a `stop` channel. Each tick calls `SweepNow()`, which scans entries in batches of `SweepBatchSize`, releasing the lock between batches so `Get` and `Set` are never blocked for long. Removing an entry also removes it from the frequency bucket and the tag index.
+  - How: `time.Ticker` loop with `select` on `ticker.C` and a `stop` channel. Each tick calls `SweepNow()`, which pops expired entries from an expiry min-heap (O(log n) each, no full scan) in batches of `SweepBatchSize`, releasing the lock between batches so `Get` and `Set` are never blocked for long. Removing an entry also removes it from the frequency bucket and the tag index.
   - Lifecycle: the goroutine is tracked with a `sync.WaitGroup`. `Close()` is idempotent (`sync.Once`), closes `stop`, and waits for the goroutine to exit. The goroutine recovers from panics, logs them at error level, and keeps running.
   - Logging: debug level line per sweep with `expired_count`, `remaining`, and `duration_ms`. Nothing is logged when zero entries expire.
   - Config: `CACHE_JANITOR_INTERVAL` (default 30s, 0 disables).
+- Concurrency design (documented at the top of `lfu.go`): one mutex guards all state; every critical section uses `defer Unlock`; the clock is read and nothing is logged while the lock is held; `*Locked` helpers never lock; `Close` never holds the lock while waiting for the janitor. The epoch protocol (`Epoch` and `SetIfEpoch`) closes the cache-aside stale-fill race.
 - Unit tests: eviction order by frequency (and by recency on ties), TTL expiry (injectable clock), tag invalidation, a `-race` concurrency test, `SweepNow()` removes only expired entries and cleans the tag index, the janitor removes expired entries without any `Get`, and `Close()` stops the goroutine (verified with a goroutine count check or `goleak`) and can be called twice safely.
 
 ### FFS-6 Evaluator (P0)
@@ -442,7 +447,7 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 
 ### FFS-7 Services (P0)
 - `FlagService`: create, get, list, update, delete, set or remove override. Each write builds before and after snapshots, writes via the DAO, appends the audit entry (actor, time, before, after, request id), then invalidates the cache tag.
-- `EvaluationService`: cache-aside using key `eval:{flag}:{user}`, tagged with the flag and consulted prerequisites, and no caching of errors.
+- `EvaluationService`: cache-aside using key `eval:{flag}:{user}`, tagged with the flag and consulted prerequisites, and no caching of errors. On a miss it must follow the epoch protocol from FFS-5 to avoid caching a stale result: read `cache.Epoch()` first, then read the flag and evaluate, then store with `cache.SetIfEpoch(...)`. The result is still returned to the caller when the store is refused.
 - Unit tests with the in-memory DAOs and a spy cache: a write invalidates, a hit skips the DAO, and audit entries have correct before and after values.
 
 ### FFS-8 HTTP layer (P0)
