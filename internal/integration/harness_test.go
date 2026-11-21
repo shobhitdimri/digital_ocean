@@ -149,6 +149,8 @@ type flagBody struct {
 	// A pointer so a missing field is distinguishable from 0.
 	RolloutPercent *int  `json:"rollout_percent"`
 	Version        int64 `json:"version"`
+
+	Requires []string `json:"requires"`
 }
 
 type evalBody struct {

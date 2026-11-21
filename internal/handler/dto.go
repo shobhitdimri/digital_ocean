@@ -20,13 +20,21 @@ type CreateFlagRequest struct {
 
 	// RolloutPercent is optional; leaving it out means 100.
 	RolloutPercent *int `json:"rollout_percent"`
+
+	// Requires lists flags that must be enabled for a user before this one can
+	// be. Optional.
+	Requires []string `json:"requires"`
 }
 
 func (r CreateFlagRequest) options() []domain.FlagOption {
-	if r.RolloutPercent == nil {
-		return nil
+	var opts []domain.FlagOption
+	if r.RolloutPercent != nil {
+		opts = append(opts, domain.WithRollout(*r.RolloutPercent))
 	}
-	return []domain.FlagOption{domain.WithRollout(*r.RolloutPercent)}
+	if len(r.Requires) > 0 {
+		opts = append(opts, domain.WithRequires(r.Requires...))
+	}
+	return opts
 }
 
 // UpdateFlagRequest is the body of PUT /v1/flags/{name}. Omitted fields are
@@ -35,10 +43,17 @@ type UpdateFlagRequest struct {
 	Description    *string `json:"description"`
 	Enabled        *bool   `json:"enabled"`
 	RolloutPercent *int    `json:"rollout_percent"`
+
+	// Requires replaces the whole prerequisite list; [] clears it and leaving
+	// it out (or null) keeps it.
+	Requires *[]string `json:"requires"`
 }
 
 func (r UpdateFlagRequest) toUpdate() service.FlagUpdate {
-	return service.FlagUpdate{Description: r.Description, Enabled: r.Enabled, RolloutPercent: r.RolloutPercent}
+	return service.FlagUpdate{
+		Description: r.Description, Enabled: r.Enabled,
+		RolloutPercent: r.RolloutPercent, Requires: r.Requires,
+	}
 }
 
 // SetOverrideRequest is the body of PUT /v1/flags/{name}/overrides/{userId}.
@@ -57,6 +72,9 @@ type FlagResponse struct {
 	// RolloutPercent is always present, 100 for a flag with no rollout.
 	RolloutPercent int `json:"rollout_percent"`
 
+	// Requires is always an array, empty for a flag with no prerequisites.
+	Requires []string `json:"requires"`
+
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -74,6 +92,7 @@ func toFlagResponse(f domain.Flag) FlagResponse {
 		Overrides:   overrides,
 
 		RolloutPercent: f.Rollout(),
+		Requires:       append([]string{}, f.Requires...),
 		Version:        f.Version,
 		CreatedAt:      f.CreatedAt,
 		UpdatedAt:      f.UpdatedAt,

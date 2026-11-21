@@ -21,7 +21,11 @@ var _ dao.FlagDAO = (*FlagDAO)(nil)
 // unchanged (a flag without the field is at 100%), but a version 1 binary would
 // silently drop the field and turn every partial rollout into a full one on its
 // next write, so it must refuse a version 2 file rather than read it.
-const schemaVersion = 2
+//
+// Version 3 added the optional requires field, for the same reason: an older
+// binary would drop the prerequisites on its next write and silently remove the
+// safety gate they provide.
+const schemaVersion = 3
 
 type flagsFile struct {
 	SchemaVersion int           `json:"schema_version"`

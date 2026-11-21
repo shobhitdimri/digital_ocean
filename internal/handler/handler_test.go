@@ -47,7 +47,7 @@ func (f *fakeFlags) Create(_ context.Context, name, desc string, enabled bool, o
 
 	// Apply the options the way the real service does, so a test can see which
 	// rollout reached it and an invalid one is rejected before "storing".
-	applied := domain.Flag{}
+	applied := domain.Flag{Name: name}
 	for _, opt := range opts {
 		if err := opt(&applied); err != nil {
 			return domain.Flag{}, err
@@ -1133,5 +1133,101 @@ func TestListedFlagsCarryTheirRollout(t *testing.T) {
 	}
 	if body.Flags[0].RolloutPercent != 50 || body.Flags[1].RolloutPercent != 100 {
 		t.Fatalf("rollouts = %d, %d; want 50, 100", body.Flags[0].RolloutPercent, body.Flags[1].RolloutPercent)
+	}
+}
+
+// ---- flag dependencies -----------------------------------------------------
+
+func TestCreateFlagWithRequires(t *testing.T) {
+	h := newHarness(t)
+	rec := h.do("POST", "/v1/flags", `{"name":"f","requires":["b","a"],"rollout_percent":10}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if h.flags.createOptions != 2 {
+		t.Fatalf("service received %d options, want rollout and requires", h.flags.createOptions)
+	}
+
+	h = newHarness(t)
+	h.do("POST", "/v1/flags", `{"name":"f","requires":[]}`)
+	if h.flags.createOptions != 0 {
+		t.Fatal("an empty requires list must not become an option")
+	}
+}
+
+func TestCreateFlagWithBadRequiresIsABadRequest(t *testing.T) {
+	for _, body := range []string{
+		`{"name":"f","requires":["f"]}`,
+		`{"name":"f","requires":["a","a"]}`,
+		`{"name":"f","requires":["has space"]}`,
+	} {
+		h := newHarness(t)
+		rec := h.do("POST", "/v1/flags", body)
+		if rec.Code != 400 || errorOf(t, rec).Code != "invalid_request" {
+			t.Fatalf("%s: got %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	for _, body := range []string{`{"name":"f","requires":"a"}`, `{"name":"f","requires":[1]}`} {
+		h := newHarness(t)
+		if rec := h.do("POST", "/v1/flags", body); rec.Code != 400 || len(h.flags.calls) != 0 {
+			t.Fatalf("%s: got %d, calls %v", body, rec.Code, h.flags.calls)
+		}
+	}
+}
+
+func TestUpdateFlagRequiresSemantics(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		wantNil bool
+		want    []string
+	}{
+		{"set", `{"requires":["a","b"]}`, false, []string{"a", "b"}},
+		{"clear with empty list", `{"requires":[]}`, false, []string{}},
+		{"null keeps", `{"requires":null,"enabled":true}`, true, nil},
+		{"absent keeps", `{"enabled":true}`, true, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			if rec := h.do("PUT", "/v1/flags/new-checkout", tt.body); rec.Code != 200 {
+				t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+			}
+			got := h.flags.update.Requires
+			if (got == nil) != tt.wantNil || (got != nil && fmt.Sprint(*got) != fmt.Sprint(tt.want)) {
+				t.Fatalf("service got %v, want nil=%v %v", got, tt.wantNil, tt.want)
+			}
+		})
+	}
+}
+
+func TestDependencyErrorsMapToStatusCodes(t *testing.T) {
+	h := newHarness(t)
+	h.flags.err = domain.Conflictf("requires would create a dependency cycle: a -> b -> a")
+	rec := h.do("PUT", "/v1/flags/a", `{"requires":["b"]}`)
+	if rec.Code != 409 || errorOf(t, rec).Code != "conflict" {
+		t.Fatalf("cycle: got %d %s", rec.Code, rec.Body.String())
+	}
+
+	h = newHarness(t)
+	h.flags.err = domain.Conflictf(`flag "payments" is required by checkout`)
+	if rec := h.do("DELETE", "/v1/flags/payments", ""); rec.Code != 409 {
+		t.Fatalf("delete of a required flag: got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestResponsesAlwaysCarryARequiresArray(t *testing.T) {
+	h := newHarness(t)
+	var raw map[string]any
+	_ = json.Unmarshal(h.do("GET", "/v1/flags/new-checkout", "").Body.Bytes(), &raw)
+	if v, ok := raw["requires"].([]any); !ok || len(v) != 0 {
+		t.Fatalf("requires = %#v, want an empty array, not null or missing", raw["requires"])
+	}
+
+	h.flags.flag.Requires = []string{"a", "b"}
+	raw = nil
+	_ = json.Unmarshal(h.do("GET", "/v1/flags/new-checkout", "").Body.Bytes(), &raw)
+	if v, _ := raw["requires"].([]any); len(v) != 2 {
+		t.Fatalf("requires = %#v", raw["requires"])
 	}
 }

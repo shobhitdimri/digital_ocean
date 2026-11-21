@@ -112,7 +112,7 @@ func TestFlagFileFormatAndNoTempLeftovers(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("file is not valid JSON: %v", err)
 	}
-	if doc.SchemaVersion != 2 || len(doc.Flags) != 2 || doc.Flags[0].Name != "a" || doc.Flags[1].Name != "b" {
+	if doc.SchemaVersion != 3 || len(doc.Flags) != 2 || doc.Flags[0].Name != "a" || doc.Flags[1].Name != "b" {
 		t.Fatalf("unexpected file contents: %s", raw)
 	}
 
@@ -138,7 +138,7 @@ func TestFlagStoreStartupValidation(t *testing.T) {
 		{"rollout over 100", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":101}]}`, "invalid flag"},
 		{"negative rollout", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":-1}]}`, "invalid flag"},
 		{"fractional rollout", `{"schema_version":2,"flags":[{"name":"x","version":1,"rollout_percent":12.5}]}`, "corrupt"},
-		{"next schema", `{"schema_version": 3, "flags": []}`, "schema version 3"},
+		{"next schema", `{"schema_version": 4, "flags": []}`, "schema version 4"},
 		{"duplicate names", `{"schema_version":1,"flags":[{"name":"x","version":1},{"name":"x","version":1}]}`, "duplicate"},
 	}
 	for _, tc := range tests {
@@ -375,8 +375,8 @@ func TestSchemaOneFileLoadsAsFullRolloutAndUpgradesOnFirstWrite(t *testing.T) {
 		SchemaVersion int `json:"schema_version"`
 	}
 	raw, _ := os.ReadFile(path)
-	if err := json.Unmarshal(raw, &doc); err != nil || doc.SchemaVersion != 2 {
-		t.Fatalf("after a write the file must be schema 2 (%v): %s", err, raw)
+	if err := json.Unmarshal(raw, &doc); err != nil || doc.SchemaVersion != 3 {
+		t.Fatalf("after a write the file must be schema 3 (%v): %s", err, raw)
 	}
 }
 
@@ -423,5 +423,34 @@ func TestRolloutIsWrittenToDiskAndSurvivesRestart(t *testing.T) {
 		if err != nil || got.Rollout() != want {
 			t.Fatalf("after restart %s = %d, %v; want %d", name, got.Rollout(), err, want)
 		}
+	}
+}
+
+func TestPrerequisitesSurviveRestartAndInvalidOnesAreRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "flags.json")
+	d1, _ := NewFlagDAO(path)
+	f, err := domain.NewFlag("dependent", "", true, time.Now().UTC(), domain.WithRequires("b", "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d1.Create(ctx, f); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(path)
+	if !strings.Contains(string(raw), `"requires": [`) {
+		t.Fatalf("requires missing from the file:\n%s", raw)
+	}
+	d2, err := NewFlagDAO(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := d2.Get(ctx, "dependent"); len(got.Requires) != 2 || got.Requires[0] != "a" {
+		t.Fatalf("after restart: %v", got.Requires)
+	}
+
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	os.WriteFile(bad, []byte(`{"schema_version":3,"flags":[{"name":"x","version":1,"requires":["x"]}]}`), 0o600)
+	if _, err := NewFlagDAO(bad); err == nil || !strings.Contains(err.Error(), "invalid flag") {
+		t.Fatalf("a flag requiring itself must be refused on load, got %v", err)
 	}
 }

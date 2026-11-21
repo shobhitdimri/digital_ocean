@@ -202,8 +202,8 @@ func TestRolloutSurvivesARestartWithTheSameAudience(t *testing.T) {
 	if !strings.Contains(onDisk, `"rollout_percent": 40`) || !strings.Contains(onDisk, `"rollout_percent": 0`) {
 		t.Fatalf("rollouts not in flags.json:\n%s", onDisk)
 	}
-	if !strings.Contains(onDisk, `"schema_version": 2`) {
-		t.Fatalf("flags.json is not schema 2:\n%s", onDisk)
+	if !strings.Contains(onDisk, `"schema_version": 3`) {
+		t.Fatalf("flags.json is not schema 3:\n%s", onDisk)
 	}
 
 	second := startServer(t, cfg)

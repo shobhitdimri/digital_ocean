@@ -1118,3 +1118,234 @@ func TestInvalidRolloutIsRejectedBeforeTheFlagIsLookedUp(t *testing.T) {
 		t.Fatalf("a valid rollout on a missing flag = %v, want ErrNotFound", err)
 	}
 }
+
+// ---- flag dependencies -----------------------------------------------------
+
+func TestCreateWithPrerequisites(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "payments", "", true)
+
+	got, err := f.svc.Create(ctx, "checkout", "", true, domain.WithRequires("payments"))
+	if err != nil || len(got.Requires) != 1 || got.Requires[0] != "payments" {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	if h := f.history(t, "checkout"); len(h) != 1 || !strings.Contains(string(h[0].After), `"requires":["payments"]`) {
+		t.Fatalf("the audit trail must record the prerequisites: %v", h)
+	}
+}
+
+func TestCreateRejectsUnknownPrerequisitesAndLeavesNoTrace(t *testing.T) {
+	f := newFixture(t)
+	_, err := f.svc.Create(reqCtx("a", "r"), "checkout", "", true, domain.WithRequires("ghost", "phantom"))
+	if !errors.Is(err, domain.ErrInvalid) || !strings.Contains(err.Error(), "ghost, phantom") {
+		t.Fatalf("err = %v, want ErrInvalid naming the unknown flags", err)
+	}
+	if all, _ := f.flags.List(context.Background()); len(all) != 0 {
+		t.Fatalf("stored %v", all)
+	}
+	if len(f.cache.Tags()) != 0 || len(f.history(t, "checkout")) != 0 {
+		t.Fatal("a rejected create left side effects")
+	}
+}
+
+func TestUpdateSetsAndClearsPrerequisites(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "payments", "", true)
+	f.svc.Create(ctx, "checkout", "", true)
+
+	got, err := f.svc.Update(ctx, "checkout", service.FlagUpdate{Requires: &[]string{"payments"}})
+	if err != nil || got.Version != 2 || len(got.Requires) != 1 {
+		t.Fatalf("set: %+v, %v", got, err)
+	}
+	h := f.history(t, "checkout")
+	before, after := decodeFlag(t, h[1].Before), decodeFlag(t, h[1].After)
+	if len(before.Requires) != 0 || len(after.Requires) != 1 {
+		t.Fatalf("history must show none -> payments: %s -> %s", h[1].Before, h[1].After)
+	}
+
+	got, err = f.svc.Update(ctx, "checkout", service.FlagUpdate{Requires: &[]string{}})
+	if err != nil || got.Version != 3 || got.Requires != nil {
+		t.Fatalf("clear: %+v, %v", got, err)
+	}
+}
+
+func TestSettingTheSamePrerequisitesInAnyOrderIsANoOp(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "a", "", true)
+	f.svc.Create(ctx, "b", "", true)
+	f.svc.Create(ctx, "top", "", true, domain.WithRequires("a", "b"))
+	f.cache.Reset()
+
+	got, err := f.svc.Update(ctx, "top", service.FlagUpdate{Requires: &[]string{"b", "a"}})
+	if err != nil || got.Version != 1 {
+		t.Fatalf("version %d, %v: same set in another order must not write", got.Version, err)
+	}
+	if len(f.history(t, "top")) != 1 || len(f.cache.Tags()) != 0 {
+		t.Fatal("no-op had side effects")
+	}
+	if _, err := f.svc.Update(ctx, "top", service.FlagUpdate{}); !errors.Is(err, domain.ErrInvalid) {
+		t.Fatalf("an empty update must stay invalid: %v", err)
+	}
+}
+
+func TestUpdateRejectsBadPrerequisites(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "a", "", true)
+	f.svc.Create(ctx, "b", "", true, domain.WithRequires("a"))
+
+	tests := []struct {
+		name     string
+		flag     string
+		requires []string
+		want     error
+	}{
+		{"itself", "b", []string{"b"}, domain.ErrInvalid},
+		{"duplicate", "b", []string{"a", "a"}, domain.ErrInvalid},
+		{"unknown", "b", []string{"ghost"}, domain.ErrInvalid},
+		{"direct cycle", "a", []string{"b"}, domain.ErrConflict},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before, _ := f.flags.Get(ctx, tt.flag)
+			_, err := f.svc.Update(ctx, tt.flag, service.FlagUpdate{Requires: &tt.requires})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			after, _ := f.flags.Get(ctx, tt.flag)
+			if after.Version != before.Version {
+				t.Fatal("a rejected update changed the flag")
+			}
+		})
+	}
+}
+
+func TestIndirectCycleIsRejectedWithItsPath(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "a", "", true)
+	f.svc.Create(ctx, "b", "", true, domain.WithRequires("a"))
+	f.svc.Create(ctx, "c", "", true, domain.WithRequires("b"))
+
+	_, err := f.svc.Update(ctx, "a", service.FlagUpdate{Requires: &[]string{"c"}})
+	if !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("err = %v, want ErrConflict", err)
+	}
+	if !strings.Contains(err.Error(), "a -> c -> b -> a") {
+		t.Fatalf("the error should show the loop, got %v", err)
+	}
+	// A diamond is not a cycle.
+	f.svc.Create(ctx, "d", "", true, domain.WithRequires("b", "c"))
+	if _, err := f.svc.Update(ctx, "d", service.FlagUpdate{Requires: &[]string{"a", "b", "c"}}); err != nil {
+		t.Fatalf("shared prerequisites must be allowed: %v", err)
+	}
+}
+
+func TestDeletingARequiredFlagIsRefusedUntilItIsReleased(t *testing.T) {
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "payments", "", true)
+	f.svc.Create(ctx, "checkout", "", true, domain.WithRequires("payments"))
+	f.svc.Create(ctx, "invoices", "", true, domain.WithRequires("payments"))
+
+	err := f.svc.Delete(ctx, "payments")
+	if !errors.Is(err, domain.ErrConflict) || !strings.Contains(err.Error(), "checkout, invoices") {
+		t.Fatalf("err = %v, want ErrConflict naming both dependents", err)
+	}
+	if _, err := f.flags.Get(ctx, "payments"); err != nil {
+		t.Fatal("the flag was deleted despite the conflict")
+	}
+	if len(f.history(t, "payments")) != 1 {
+		t.Fatal("a refused delete was audited")
+	}
+
+	empty := []string{}
+	f.svc.Update(ctx, "checkout", service.FlagUpdate{Requires: &empty})
+	f.svc.Delete(ctx, "invoices")
+	if err := f.svc.Delete(ctx, "payments"); err != nil {
+		t.Fatalf("delete after release: %v", err)
+	}
+}
+
+func TestChangingAFlagInvalidatesOnlyItsOwnTag(t *testing.T) {
+	// Dependents are invalidated through the cache tags the evaluation stored
+	// (every consulted flag), so the service only has to invalidate the flag it
+	// changed.
+	f := newFixture(t)
+	ctx := reqCtx("a", "r")
+	f.svc.Create(ctx, "payments", "", true)
+	f.svc.Create(ctx, "checkout", "", true, domain.WithRequires("payments"))
+	f.cache.Reset()
+
+	f.svc.Update(ctx, "payments", service.FlagUpdate{Enabled: ptr(false)})
+	if tags := f.cache.Tags(); len(tags) != 1 || tags[0] != "flag:payments" {
+		t.Fatalf("invalidated %v", tags)
+	}
+}
+
+// Two writers, each holding only their own flag's lock, could both pass a cycle
+// check and together create a cycle. The graph lock must make exactly one win.
+func TestConcurrentOppositeRequirementsNeverFormACycle(t *testing.T) {
+	for round := 0; round < 25; round++ {
+		f := newFixture(t)
+		ctx := reqCtx("a", "r")
+		f.svc.Create(ctx, "a", "", true)
+		f.svc.Create(ctx, "b", "", true)
+
+		var wg sync.WaitGroup
+		results := make([]error, 2)
+		for i, edge := range [][2]string{{"a", "b"}, {"b", "a"}} {
+			wg.Add(1)
+			go func(i int, from, to string) {
+				defer wg.Done()
+				_, results[i] = f.svc.Update(reqCtx("w", fmt.Sprintf("r%d", i)), from, service.FlagUpdate{Requires: &[]string{to}})
+			}(i, edge[0], edge[1])
+		}
+		wg.Wait()
+
+		wins := 0
+		for _, err := range results {
+			switch {
+			case err == nil:
+				wins++
+			case !errors.Is(err, domain.ErrConflict):
+				t.Fatalf("round %d: unexpected error %v", round, err)
+			}
+		}
+		if wins != 1 {
+			t.Fatalf("round %d: %d of 2 opposite requirements were accepted (%v), want exactly 1", round, wins, results)
+		}
+	}
+}
+
+// Deleting a flag while another is being created that requires it must not
+// leave a flag pointing at nothing.
+func TestConcurrentDeleteAndRequireNeverDangle(t *testing.T) {
+	for round := 0; round < 25; round++ {
+		f := newFixture(t)
+		ctx := reqCtx("a", "r")
+		f.svc.Create(ctx, "base", "", true)
+
+		var wg sync.WaitGroup
+		var delErr, createErr error
+		wg.Add(2)
+		go func() { defer wg.Done(); delErr = f.svc.Delete(reqCtx("d", "r1"), "base") }()
+		go func() {
+			defer wg.Done()
+			_, createErr = f.svc.Create(reqCtx("c", "r2"), "dep", "", true, domain.WithRequires("base"))
+		}()
+		wg.Wait()
+
+		_, baseErr := f.flags.Get(ctx, "base")
+		dep, depErr := f.flags.Get(ctx, "dep")
+		if depErr == nil && baseErr != nil {
+			t.Fatalf("round %d: %q requires %v but base is gone (delete=%v create=%v)", round, dep.Name, dep.Requires, delErr, createErr)
+		}
+		if delErr == nil && createErr == nil {
+			t.Fatalf("round %d: both succeeded", round)
+		}
+	}
+}

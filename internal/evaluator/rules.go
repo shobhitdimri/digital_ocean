@@ -4,10 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
+
+	"feature-flag-service/internal/domain"
 )
 
 // Compile-time proof that each rule satisfies the Rule contract.
 var (
+	_ Rule = PrerequisiteRule{}
 	_ Rule = OverrideRule{}
 	_ Rule = GlobalOffRule{}
 	_ Rule = RolloutRule{}
@@ -16,20 +20,56 @@ var (
 
 // DefaultRules is the standard chain. The order is the evaluation rule set:
 //
-//  1. a per-user override wins over everything below it
-//  2. otherwise a globally disabled flag is off
-//  3. otherwise a flag rolled out to less than 100% is on for the users whose
+//  1. every required flag must be enabled for the user, otherwise the flag is
+//     off; this is a hard gate that not even an override can open
+//  2. a per-user override wins over everything below it
+//  3. otherwise a globally disabled flag is off
+//  4. otherwise a flag rolled out to less than 100% is on for the users whose
 //     bucket falls inside that share, and off for the rest
-//  4. otherwise the flag is on
-//
-// Prerequisites, when added, go first.
+//  5. otherwise the flag is on
 func DefaultRules() []Rule {
 	return []Rule{
+		PrerequisiteRule{},
 		OverrideRule{},
 		GlobalOffRule{},
 		RolloutRule{},
 		GlobalOnRule{},
 	}
+}
+
+// PrerequisiteRule turns the flag off for a user unless every flag it requires
+// is enabled for that same user. Each prerequisite is evaluated through the full
+// chain, so its rollout and overrides count: a prerequisite rolled out to 10%
+// limits the dependent flag to those 10% of users. A prerequisite that no longer
+// exists counts as unmet. The service stops that from happening, but off is the
+// safe answer if it does.
+//
+// It runs before the override rule on purpose: a dependency is a safety
+// property ("checkout-v2 is meaningless without payments-v2"), and a per-user
+// override must not be able to break it.
+type PrerequisiteRule struct{}
+
+// Name implements Rule.
+func (PrerequisiteRule) Name() string { return "prerequisite" }
+
+// Apply implements Rule.
+func (PrerequisiteRule) Apply(ctx context.Context, in Input) (Decision, bool, error) {
+	if len(in.Flag.Requires) > 0 && in.Evaluate == nil {
+		return Decision{}, false, errors.New("input has no Evaluate function to resolve prerequisites")
+	}
+	for _, name := range in.Flag.Requires {
+		d, err := in.Evaluate(ctx, name)
+		if errors.Is(err, domain.ErrNotFound) {
+			return Decision{Enabled: false, Reason: ReasonPrerequisiteUnmet}, true, nil
+		}
+		if err != nil {
+			return Decision{}, false, err
+		}
+		if !d.Enabled {
+			return Decision{Enabled: false, Reason: ReasonPrerequisiteUnmet}, true, nil
+		}
+	}
+	return Decision{}, false, nil
 }
 
 // OverrideRule applies a per-user override, if the user has one.

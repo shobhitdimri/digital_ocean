@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"slices"
+	"sort"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -15,6 +17,10 @@ const (
 
 	// FullRollout is the rollout percentage of a flag nobody has restricted.
 	FullRollout = 100
+
+	// MaxRequires caps the prerequisites of one flag. Evaluating a flag walks
+	// its prerequisites, so the cap keeps the cost of one evaluation small.
+	MaxRequires = 10
 )
 
 // Flag is a feature flag with a global state and optional per-user overrides.
@@ -32,6 +38,11 @@ type Flag struct {
 	// never modified in place, so copies of a Flag may share it.
 	RolloutPercent *int `json:"rollout_percent,omitempty"`
 
+	// Requires names flags that must all be enabled for a user before this flag
+	// can be, however this flag itself is configured. It is stored sorted and
+	// without duplicates. Change it through SetRequires.
+	Requires []string `json:"requires,omitempty"`
+
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -43,6 +54,11 @@ type FlagOption func(*Flag) error
 // WithRollout starts the flag at the given rollout percentage (0 to 100).
 func WithRollout(percent int) FlagOption {
 	return func(f *Flag) error { return f.SetRollout(percent) }
+}
+
+// WithRequires starts the flag with the given prerequisite flags.
+func WithRequires(names ...string) FlagOption {
+	return func(f *Flag) error { return f.SetRequires(names) }
 }
 
 // NewFlag builds a validated flag at version 1.
@@ -79,6 +95,9 @@ func (f Flag) Validate() error {
 			return err
 		}
 	}
+	if err := ValidateRequires(f.Name, f.Requires); err != nil {
+		return err
+	}
 	if len(f.Overrides) > MaxOverridesPerFlag {
 		return Invalidf("flag has %d overrides, maximum is %d", len(f.Overrides), MaxOverridesPerFlag)
 	}
@@ -96,6 +115,48 @@ func ValidateRolloutPercent(percent int) error {
 	if percent < 0 || percent > FullRollout {
 		return Invalidf("rollout_percent is %d, must be a whole number from 0 to %d", percent, FullRollout)
 	}
+	return nil
+}
+
+// ValidateRequires checks the prerequisite list of the flag called name: valid
+// names, no duplicates, no reference to the flag itself, at most MaxRequires.
+// It cannot check that the prerequisites exist or that they form no cycle; the
+// service does, because that needs the other flags.
+func ValidateRequires(name string, requires []string) error {
+	if len(requires) > MaxRequires {
+		return Invalidf("flag requires %d flags, maximum is %d", len(requires), MaxRequires)
+	}
+	seen := make(map[string]struct{}, len(requires))
+	for _, r := range requires {
+		if err := ValidateName(r); err != nil {
+			return Invalidf("requires: %v", err)
+		}
+		if r == name {
+			return Invalidf("flag %q cannot require itself", name)
+		}
+		if _, dup := seen[r]; dup {
+			return Invalidf("requires lists %q more than once", r)
+		}
+		seen[r] = struct{}{}
+	}
+	return nil
+}
+
+// SetRequires replaces the prerequisites. The list is copied and sorted, so
+// the same set always has the same stored form and two flags can be compared
+// without caring about order; an empty list clears them. On error the flag is
+// unchanged.
+func (f *Flag) SetRequires(names []string) error {
+	if err := ValidateRequires(f.Name, names); err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		f.Requires = nil
+		return nil
+	}
+	sorted := slices.Clone(names)
+	sort.Strings(sorted)
+	f.Requires = sorted
 	return nil
 }
 
@@ -158,6 +219,7 @@ func (f *Flag) RemoveOverride(userID string) bool {
 // Clone returns a deep copy. Flag contains a map, so a plain assignment would
 // share it; DAOs, caches and audit snapshots must hold independent copies.
 func (f Flag) Clone() Flag {
+	f.Requires = slices.Clone(f.Requires)
 	if f.RolloutPercent != nil {
 		percent := *f.RolloutPercent
 		f.RolloutPercent = &percent

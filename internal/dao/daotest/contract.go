@@ -37,7 +37,8 @@ func sameFlag(a, b domain.Flag) bool {
 		a.CreatedAt.Equal(b.CreatedAt) &&
 		a.UpdatedAt.Equal(b.UpdatedAt) &&
 		reflect.DeepEqual(a.Overrides, b.Overrides) &&
-		reflect.DeepEqual(a.RolloutPercent, b.RolloutPercent)
+		reflect.DeepEqual(a.RolloutPercent, b.RolloutPercent) &&
+		reflect.DeepEqual(a.Requires, b.Requires)
 }
 
 func cancelled() context.Context {
@@ -277,6 +278,39 @@ func RunFlagDAOContract(t *testing.T, newDAO func(t *testing.T) dao.FlagDAO) {
 		}
 		if got, _ := d.Get(ctx, "r37"); got.Rollout() != 100 || got.RolloutPercent != nil {
 			t.Fatalf("returning to 100%% must clear the restriction, got %+v", got.RolloutPercent)
+		}
+	})
+
+	t.Run("prerequisites are stored, updated and isolated from caller mutation", func(t *testing.T) {
+		d := newDAO(t)
+		f, err := domain.NewFlag("dependent", "", true, baseTime, domain.WithRequires("zeta", "alpha"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.Create(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+		got, _ := d.Get(ctx, "dependent")
+		if !sameFlag(got, f) || len(got.Requires) != 2 || got.Requires[0] != "alpha" {
+			t.Fatalf("Get = %v, want %v", got.Requires, f.Requires)
+		}
+
+		f.Requires[0] = "mutated"
+		got.Requires[1] = "mutated"
+		list, _ := d.List(ctx)
+		list[0].Requires[0] = "mutated"
+		if again, _ := d.Get(ctx, "dependent"); again.Requires[0] != "alpha" || again.Requires[1] != "zeta" {
+			t.Fatalf("a caller mutation leaked into the store: %v", again.Requires)
+		}
+
+		next, _ := d.Get(ctx, "dependent")
+		_ = next.SetRequires(nil)
+		next.Version = 2
+		if err := d.Update(ctx, next); err != nil {
+			t.Fatal(err)
+		}
+		if again, _ := d.Get(ctx, "dependent"); len(again.Requires) != 0 {
+			t.Fatalf("clearing the prerequisites did not stick: %v", again.Requires)
 		}
 	})
 

@@ -2,13 +2,13 @@
 
 A REST service, written in Go with only the standard library, that stores feature flags, manages their state globally and per user, and tells you whether a feature is on for a given user. Evaluations are cached in memory so they stay fast, and every change is recorded in an audit trail.
 
-- **Flags:** create, read, update, delete. Each has a name, a description, a global on/off state, an optional rollout percentage and optional per-user overrides.
+- **Flags:** create, read, update, delete. Each has a name, a description, a global on/off state, an optional rollout percentage, optional prerequisite flags and optional per-user overrides.
 - **Evaluation:** `GET /v1/evaluate?flag=X&user_id=U` answers `enabled` plus the reason. A per-user override beats the global state, and an enabled flag can be limited to a percentage of users. See [Percentage rollout](#percentage-rollout).
 - **Caching:** an in-memory LFU cache with a time limit (TTL), invalidated precisely when a flag changes. See [Caching](#caching).
 - **Audit trail:** who changed what, when, with the previous and the new value. See [Audit trail](#audit-trail).
 - **Production behaviour:** structured JSON logs with request ids, graceful shutdown, crash-safe file storage, and no data races (the tests run under `-race`).
 
-Planned but **not built yet**: flag dependencies (prerequisite flags) and the Docker/DigitalOcean deployment. See [Roadmap](#roadmap).
+Planned but **not built yet**: the Docker/DigitalOcean deployment. See [Roadmap](#roadmap).
 
 ## Contents
 
@@ -90,16 +90,17 @@ Given a flag and a user, the rules run in order and the first one that applies d
 
 | Order | Rule | Applies when | Result | `reason` |
 | --- | --- | --- | --- | --- |
-| 1 | User override | the user has an override on this flag | the override's value, whatever the global state is | `user_override` |
-| 2 | Global off | the flag is globally disabled | off | `global_off` |
-| 3 | Rollout | the flag is enabled but `rollout_percent` is below 100 | on for the users whose bucket falls inside the percentage, off for the rest | `rollout_included` or `rollout_excluded` |
-| 4 | Global on | the flag is globally enabled (and not limited by a rollout) | on | `global_on` |
+| 1 | Prerequisites | the flag has `requires` and one of them is off for this user (or missing) | off, even if the user has an override | `prerequisite_unmet` |
+| 2 | User override | the user has an override on this flag | the override's value, whatever the global state is | `user_override` |
+| 3 | Global off | the flag is globally disabled | off | `global_off` |
+| 4 | Rollout | the flag is enabled but `rollout_percent` is below 100 | on for the users whose bucket falls inside the percentage, off for the rest | `rollout_included` or `rollout_excluded` |
+| 5 | Global on | the flag is globally enabled (and not limited by a rollout) | on | `global_on` |
 
 So an override can turn a feature **on** for one user while it is globally off (a beta tester), or **off** for one user while it is globally on or outside the rollout (an opt-out). Overrides do not depend on each other and do not affect other users. A flag at 100% (the default) skips the rollout rule and reports `global_on`, exactly as before the rollout existed.
 
 An unknown flag is a `404`, never a `500` and never "off".
 
-The rules are a chain of small objects behind one `Rule` interface (`internal/evaluator`). Percentage rollout was added as a new rule between global off and global on without changing the evaluator or the other rules, and prerequisites will be added the same way (see the [Roadmap](#roadmap)).
+The rules are a chain of small objects behind one `Rule` interface (`internal/evaluator`). Percentage rollout and prerequisites were each added as a new rule without changing the other rules.
 
 ### Percentage rollout
 
@@ -120,6 +121,24 @@ curl -X PUT localhost:8080/v1/flags/new-search -H 'X-Actor: alice' -H 'Content-T
 - **Defaults and edges:** a flag with no `rollout_percent` is at 100, which is the same as no rollout. 0 is on for nobody except users with an override. Values outside 0 to 100, fractions and non-numbers are a `400 invalid_request`.
 - **Why SHA-256:** the first plan used FNV-1a, which is cheaper. Measured on 100,000 zero-padded sequential ids it spread users visibly unevenly (chi-square 218 against an expected 99 for a uniform hash) and correlated the cohorts of different flags. SHA-256 measured at the expected value. Its cost does not matter here because answers are cached.
 - **Cache:** a rollout change is an ordinary flag update, so it invalidates the flag's cached answers like any other write.
+
+### Flag dependencies
+
+A flag can require other flags: `requires` lists flags that must all be **on for the same user** before this flag can be on.
+
+```bash
+curl -X POST localhost:8080/v1/flags -H 'X-Actor: me' -H 'Content-Type: application/json' \
+  -d '{"name":"checkout-v2","enabled":true,"requires":["payments-v2"]}'
+curl -X PUT localhost:8080/v1/flags/checkout-v2 -H 'X-Actor: me' -H 'Content-Type: application/json' \
+  -d '{"requires":[]}'          # [] clears; leaving the field out keeps it
+```
+
+- **Hard gate:** the check runs before overrides, so a per-user override cannot turn on a flag whose prerequisite is off. A dependency is a safety property, not a preference.
+- **Per user, through the full chain:** each prerequisite is evaluated for the same user with its own overrides, rollout and prerequisites. A prerequisite at a 10% rollout limits the dependent flag to that 10%. Chains (`a` needs `b` needs `c`) work; a shared prerequisite is evaluated once.
+- **Writes are checked:** an unknown prerequisite, a flag requiring itself, a duplicate, or more than 10 prerequisites is a `400`. A change that would create a cycle (`a -> c -> b -> a`) is a `409 conflict` that shows the loop. Deleting a flag that others still require is a `409` naming them.
+- **Concurrency:** every change to the dependency graph takes one graph lock before the per-flag lock, always in that order. Without it two requests (`a` requires `b`, `b` requires `a`) could each pass the cycle check and together create one; a test proves exactly one wins.
+- **Cache:** a cached answer is tagged with every flag consulted to produce it, including prerequisites, so changing or deleting a prerequisite invalidates its dependents' answers with no extra bookkeeping.
+- **Bad stored data:** the service never stores a cycle, but a hand-edited file could contain one. Evaluation then fails with an internal error (and a depth limit of 32) instead of hanging.
 
 ## Caching
 
@@ -259,11 +278,11 @@ The design follows SOLID throughout, in concrete ways: handlers each take their 
 
 | Method and path | Purpose | Success | Errors |
 | --- | --- | --- | --- |
-| `POST /v1/flags` | create a flag (`name`, `description`, `enabled`, `rollout_percent`) | 201 | 400, 409 |
+| `POST /v1/flags` | create a flag (`name`, `description`, `enabled`, `rollout_percent`, `requires`) | 201 | 400, 409 |
 | `GET /v1/flags` | list flags | 200 | |
 | `GET /v1/flags/{name}` | read one flag | 200 | 404 |
-| `PUT /v1/flags/{name}` | update `description`, `enabled` and/or `rollout_percent` | 200 | 400, 404 |
-| `DELETE /v1/flags/{name}` | delete a flag | 204 | 404 |
+| `PUT /v1/flags/{name}` | update `description`, `enabled`, `rollout_percent` and/or `requires` | 200 | 400, 404, 409 (cycle) |
+| `DELETE /v1/flags/{name}` | delete a flag | 204 | 404, 409 (required by other flags) |
 | `PUT /v1/flags/{name}/overrides/{userId}` | set a user's override, body `{"enabled": true}` | 200 | 400, 404 |
 | `DELETE /v1/flags/{name}/overrides/{userId}` | remove it | 204 | 404 (flag or override missing) |
 | `GET /v1/evaluate?flag=X&user_id=U` | evaluate | 200 | 400, 404 |
@@ -297,7 +316,7 @@ Every error has the same shape, including unknown routes and wrong methods (whic
 | 404 | `not_found` | unknown flag (or override), unknown route |
 | 405 | `method_not_allowed` | wrong method for a known path |
 | 409 | `already_exists` | creating a flag that exists |
-| 409 | `conflict` | the flag was changed by someone else mid-update (retried internally first) |
+| 409 | `conflict` | the flag was changed by someone else mid-update (retried internally first); `requires` would create a cycle; deleting a flag other flags require |
 | 413 | `body_too_large` | body larger than 1 MiB |
 | 415 | `unsupported_media_type` | body is not `application/json` |
 | 499 | `client_closed_request` | the client went away before the request finished |
@@ -316,13 +335,14 @@ A missing flag is always a `404`, on every route that takes a flag name.
   "enabled": true,
   "overrides": { "u42": true },
   "rollout_percent": 100,
+  "requires": [],
   "version": 3,
   "created_at": "2026-11-21T09:43:20.347543261Z",
   "updated_at": "2026-11-21T09:43:20.378067222Z"
 }
 ```
 
-`version` starts at 1 and increases by one with every change. `rollout_percent` is always present in responses, 100 when no rollout is set. The evaluation response is `{"flag","user_id","enabled","reason","source"}` where `reason` is `user_override`, `global_off`, `rollout_included`, `rollout_excluded` or `global_on`, and `source` is `cache` or `store`. The list response is `{"flags":[...]}`.
+`version` starts at 1 and increases by one with every change. `rollout_percent` is always present in responses, 100 when no rollout is set, and `requires` is always an array. The evaluation response is `{"flag","user_id","enabled","reason","source"}` where `reason` is `user_override`, `global_off`, `rollout_included`, `rollout_excluded`, `prerequisite_unmet` or `global_on`, and `source` is `cache` or `store`. The list response is `{"flags":[...]}`.
 
 ## Audit trail
 
@@ -405,7 +425,7 @@ Storage sits behind two interfaces (`FlagDAO`, `AuditDAO`). The shipped implemen
 - **Restarts** lose nothing but the cache, which starts cold and refills.
 - **Files are private** (mode 0600) and the service is the only intended writer.
 
-- **Schema version.** `flags.json` carries a `schema_version`, now 2: version 2 added the optional `rollout_percent` field. Version 1 files load unchanged (a flag without the field is at 100%). A binary that only knows version 1 refuses a version 2 file instead of reading it, because it would drop `rollout_percent` on its next write and silently turn every partial rollout into a full one. A file with a newer version than the binary knows is refused the same way. There is no downgrade path once a version 2 file has been written.
+- **Schema version.** `flags.json` carries a `schema_version`, now 3: version 2 added the optional `rollout_percent` field and version 3 the optional `requires` field. Older files load unchanged (a flag without a field is at 100% with no prerequisites). An older binary refuses a newer file instead of reading it, because it would drop the new fields on its next write and silently turn partial rollouts into full ones or remove the safety gate of a prerequisite. A file with a newer version than the binary knows is refused the same way. There is no downgrade path once a newer file has been written.
 
 A single JSON file is a deliberate choice for this stage: simple to inspect and back up, and plenty for a flag set that is small and read far more than it is written. It rewrites the whole file on each change, so it suits thousands of flags, not millions.
 
@@ -483,7 +503,7 @@ internal/
   config/              environment configuration and validation
   domain/              Flag, AuditEntry, validation, sentinel errors (imports nothing else)
   dao/                 storage interfaces; file/ and memory/ implementations; daotest/ shared contract tests
-  evaluator/           rule chain: override, global off, rollout, global on
+  evaluator/           rule chain: prerequisites, override, global off, rollout, global on
   service/             flag, evaluation and audit services; per-flag lock; consumer-defined interfaces
   handler/             one handler per concern, error mapping, wire types
   middleware/          request id, actor, logging, panic recovery, body limit
@@ -502,9 +522,8 @@ PLAN.md                the engineering plan: tickets, design decisions, diagrams
 
 ## Roadmap
 
-Percentage rollout is built (see [Percentage rollout](#percentage-rollout)). Planned as the next tickets in `PLAN.md`:
+Percentage rollout and flag dependencies are built. Planned as the next ticket in `PLAN.md`:
 
-- **Flag dependencies.** A flag can require other flags to be on. A prerequisite is a hard gate, checked before overrides, so a dependent feature can never be on without what it relies on. Creating a cycle is rejected, and deleting a flag that others require returns 409. Cached answers will be tagged with every flag they consulted, so changing a prerequisite invalidates its dependents with no extra bookkeeping.
 - **Deployment.** A Dockerfile and DigitalOcean deployment, with the stop timeout set above the graceful-shutdown window.
 
 Possible later work: Postgres in place of the JSON files, Redis or pub/sub invalidation for multiple instances, and an OpenAPI description.

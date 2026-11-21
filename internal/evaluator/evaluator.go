@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"feature-flag-service/internal/domain"
 )
@@ -29,6 +30,16 @@ import (
 // indicates a misconfigured chain (no terminal rule), not bad input, so it does
 // not wrap a domain sentinel and surfaces as an internal error.
 var ErrNoDecision = errors.New("evaluator: no rule produced a decision")
+
+// ErrDependencyCycle means evaluating a flag led back to a flag already being
+// evaluated, or went deeper than MaxDependencyDepth. The service refuses to
+// store such a graph, so this only happens when the data was edited by hand. It
+// does not wrap a domain sentinel: it is a data fault, not bad input, and
+// surfaces as an internal error.
+var ErrDependencyCycle = errors.New("evaluator: flag dependencies form a cycle or nest too deeply")
+
+// MaxDependencyDepth bounds how many flags deep a prerequisite chain may go.
+const MaxDependencyDepth = 32
 
 // Reason explains why an evaluation produced its result.
 type Reason string
@@ -43,6 +54,10 @@ const (
 	// outside the rolled-out share.
 	ReasonRolloutIncluded Reason = "rollout_included"
 	ReasonRolloutExcluded Reason = "rollout_excluded"
+
+	// ReasonPrerequisiteUnmet is reported when a required flag is off for the
+	// user, or no longer exists.
+	ReasonPrerequisiteUnmet Reason = "prerequisite_unmet"
 )
 
 // FlagLookup reads flags by name. It is the only capability the evaluator and
@@ -60,6 +75,14 @@ type Input struct {
 	// Flags looks up other flags, for rules that depend on them. Every name
 	// looked up is recorded in Result.Consulted.
 	Flags FlagLookup
+
+	// Evaluate evaluates another flag for the same user through the whole rule
+	// chain, so a prerequisite's own overrides, rollout and prerequisites all
+	// count. The flag is recorded in Result.Consulted. It returns an error
+	// wrapping domain.ErrNotFound when the flag does not exist and
+	// ErrDependencyCycle when the flags loop. Answers are remembered for the
+	// rest of the evaluation, so a flag required twice is evaluated once.
+	Evaluate func(ctx context.Context, flagName string) (Decision, error)
 }
 
 // Decision is a rule's verdict.
@@ -167,25 +190,84 @@ func (e *Evaluator) EvaluateFlag(ctx context.Context, flag domain.Flag, userID s
 }
 
 func (e *Evaluator) run(ctx context.Context, flag domain.Flag, userID string, rec *recorder) (Result, error) {
-	in := Input{Flag: flag, UserID: userID, Flags: rec}
+	sess := &session{e: e, rec: rec, userID: userID, memo: make(map[string]memoEntry)}
+	d, decidedBy, err := sess.decide(ctx, flag)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{
+		Flag:      flag.Name,
+		UserID:    userID,
+		Enabled:   d.Enabled,
+		Reason:    d.Reason,
+		DecidedBy: decidedBy,
+		Consulted: rec.names(),
+	}, nil
+}
 
-	for _, rule := range e.rules {
+type memoEntry struct {
+	d   Decision
+	err error
+}
+
+// session is the state of one evaluation: whose answer is wanted, which flags
+// have been read, which are being evaluated right now (to catch loops) and
+// which are already answered. It lives for one call and is used by one
+// goroutine, so it needs no locking.
+type session struct {
+	e      *Evaluator
+	rec    *recorder
+	userID string
+	memo   map[string]memoEntry
+	stack  []string
+}
+
+// decide runs the rule chain for one flag and returns the verdict with the name
+// of the rule that gave it.
+func (s *session) decide(ctx context.Context, flag domain.Flag) (Decision, string, error) {
+	if len(s.stack) >= MaxDependencyDepth {
+		return Decision{}, "", fmt.Errorf("%w: more than %d flags deep at %q", ErrDependencyCycle, MaxDependencyDepth, flag.Name)
+	}
+	s.stack = append(s.stack, flag.Name)
+	defer func() { s.stack = s.stack[:len(s.stack)-1] }()
+
+	in := Input{Flag: flag, UserID: s.userID, Flags: s.rec, Evaluate: s.resolve}
+	for _, rule := range s.e.rules {
 		d, decided, err := rule.Apply(ctx, in)
 		if err != nil {
-			return Result{}, fmt.Errorf("rule %q: %w", rule.Name(), err)
+			return Decision{}, "", fmt.Errorf("rule %q: %w", rule.Name(), err)
 		}
 		if decided {
-			return Result{
-				Flag:      flag.Name,
-				UserID:    userID,
-				Enabled:   d.Enabled,
-				Reason:    d.Reason,
-				DecidedBy: rule.Name(),
-				Consulted: rec.names(),
-			}, nil
+			return d, rule.Name(), nil
 		}
 	}
-	return Result{}, fmt.Errorf("%w for flag %q", ErrNoDecision, flag.Name)
+	return Decision{}, "", fmt.Errorf("%w for flag %q", ErrNoDecision, flag.Name)
+}
+
+// resolve answers a rule's request to evaluate another flag.
+func (s *session) resolve(ctx context.Context, name string) (Decision, error) {
+	for _, active := range s.stack {
+		if active == name {
+			return Decision{}, fmt.Errorf("%w: %s -> %s", ErrDependencyCycle, strings.Join(s.stack, " -> "), name)
+		}
+	}
+	if m, ok := s.memo[name]; ok {
+		return m.d, m.err
+	}
+	flag, err := s.rec.Get(ctx, name)
+	if err == nil {
+		var d Decision
+		d, _, err = s.decide(ctx, flag)
+		if err == nil {
+			s.memo[name] = memoEntry{d: d}
+			return d, nil
+		}
+	}
+	// A cancelled context is not a property of the flag, so it is not remembered.
+	if ctx.Err() == nil {
+		s.memo[name] = memoEntry{err: err}
+	}
+	return Decision{}, err
 }
 
 // recorder decorates a FlagLookup to remember which flags were read. It is

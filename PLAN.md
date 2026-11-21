@@ -601,9 +601,18 @@ Done. An enabled flag can be limited to a share of users with `rollout_percent` 
 - Done when: determinism, the 0 and 100 edges and the distribution tests pass, and the curl script proves the rule against a real server. Verified.
 
 ### FFS-13 Flag dependencies (P2)
-- Add `Requires` to the flag and API, plus the `PrerequisiteRule`.
-- On write: reject unknown prerequisites (400), reject cycles with DFS (409), and block deleting a flag that others require (409).
-- Tag-based invalidation already covers dependents. Tests: prerequisite off makes the dependent false, a cycle is rejected, and changing the prerequisite invalidates the dependent's cache.
+Done. A flag can list `requires` (other flags that must be on for the same user). Quick-verification scope was chosen on request: unit tests per layer, one end-to-end file and a live API check; no stress runs.
+
+**Design**
+- Rule chain is now prerequisites, override, global off, rollout, global on. `PrerequisiteRule` is first: a dependency is a safety property, so an override cannot bypass it (pinned by `TestOverrideCannotBypassAnUnmetPrerequisite`). Reason `prerequisite_unmet`.
+- Each prerequisite is evaluated for the same user through the whole chain (its own overrides, rollout and prerequisites), via `Input.Evaluate`, provided by a per-evaluation `session` that memoises answers (a diamond evaluates the shared flag once), detects loops with a stack and bounds depth at 32. A missing prerequisite counts as unmet; a loop in stored data is `ErrDependencyCycle` (internal error), never a hang.
+- Cache: prerequisites are read through the existing recorder, so `Result.Consulted` and therefore the cache tags already include them. No invalidation code was added; the missing-flag case is covered because the recorder notes a name even when the lookup fails and `Create` already invalidates its tag (this is the mutant that FFS-7 noted would start to matter).
+- Domain: `Flag.Requires []string` stored sorted and de-duplicated (`SetRequires`), max 10, no self reference; `Clone` copies the slice. Update uses `*[]string` so `[]` clears and null/absent keeps it.
+- Service: unknown prerequisite is 400, a cycle is 409 with the path (`a -> c -> b -> a`), deleting a required flag is 409 naming the dependents; setting the same set in any order is a no-op.
+- Concurrency: per-flag locks are not enough, since `a requires b` and `b requires a` hold different locks and can both pass the cycle check. All edge changes (create with requires, update of requires, delete) take one graph lock first, always before the per-flag lock, so lock order is graph, flag, DAO/cache. Verified by removing the lock: `TestConcurrentOppositeRequirementsNeverFormACycle` fails (both edges accepted). `TestConcurrentDeleteAndRequireNeverDangle` covers delete versus create.
+- File schema moves to 3 (older binaries must refuse it or they would drop `requires` and remove the gate).
+
+**Tests** evaluator (gate, per-user, chains, missing, consulted tags, diamond, cycle, depth, lookup failure, nil Evaluate), domain, DAO contract (both stores) and file format, service, handler, and `internal/integration/dependency_test.go` end to end. Live check with curl: gate, override bypass refused, cycle 409, unknown 400, delete-required 409, release then delete 204.
 
 ### FFS-14 Containerisation and DigitalOcean deploy (P2)
 - Multi-stage `Dockerfile` (distroless or alpine, non-root user, volume for `data/` and `logs/`). Use the exec form of `ENTRYPOINT` so the Go process is PID 1 and receives SIGTERM directly, which the graceful shutdown in FFS-8A depends on. Set the platform's stop timeout above `SHUTDOWN_TIMEOUT`.

@@ -380,3 +380,89 @@ func TestRolloutJSONRepresentation(t *testing.T) {
 		t.Fatalf("a record written before rollouts existed must read as 100%%, got %d", old.Rollout())
 	}
 }
+
+func TestSetRequiresSortsCopiesAndClears(t *testing.T) {
+	f := Flag{Name: "f"}
+	in := []string{"zeta", "alpha", "mid"}
+	if err := f.SetRequires(in); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(f.Requires, ","); got != "alpha,mid,zeta" {
+		t.Fatalf("Requires = %s, want sorted", got)
+	}
+	if in[0] != "zeta" {
+		t.Fatal("SetRequires reordered the caller's slice")
+	}
+	in[1] = "changed"
+	if f.Requires[0] != "alpha" {
+		t.Fatal("the flag shares memory with the caller's slice")
+	}
+	if err := f.SetRequires([]string{}); err != nil || f.Requires != nil {
+		t.Fatalf("an empty list must clear the prerequisites to nil, got %v, %v", f.Requires, err)
+	}
+}
+
+func TestRequiresValidation(t *testing.T) {
+	many := make([]string, MaxRequires+1)
+	for i := range many {
+		many[i] = fmt.Sprintf("dep-%d", i)
+	}
+	tests := []struct {
+		name     string
+		requires []string
+		wantErr  bool
+	}{
+		{"none", nil, false},
+		{"one", []string{"other"}, false},
+		{"at the limit", many[:MaxRequires], false},
+		{"over the limit", many, true},
+		{"itself", []string{"f"}, true},
+		{"duplicate", []string{"a", "a"}, true},
+		{"bad name", []string{"has space"}, true},
+		{"empty name", []string{""}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := Flag{Name: "f", Requires: []string{"keep"}}
+			err := f.SetRequires(tt.requires)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("SetRequires err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("error must wrap ErrInvalid: %v", err)
+				}
+				if len(f.Requires) != 1 || f.Requires[0] != "keep" {
+					t.Fatalf("a rejected SetRequires changed the flag: %v", f.Requires)
+				}
+			}
+			if verr := (Flag{Name: "f", Requires: tt.requires}).Validate(); (verr != nil) != tt.wantErr {
+				t.Fatalf("Validate err = %v, wantErr %v", verr, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewFlagWithRequiresAndCloneIsDeep(t *testing.T) {
+	f, err := NewFlag("f", "", true, time.Now(), WithRequires("b", "a"), WithRollout(20))
+	if err != nil || len(f.Requires) != 2 || f.Requires[0] != "a" || f.Rollout() != 20 {
+		t.Fatalf("got %+v, %v", f, err)
+	}
+	if _, err := NewFlag("f", "", true, time.Now(), WithRequires("f")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("self-requirement: %v", err)
+	}
+	c := f.Clone()
+	c.Requires[0] = "zzz"
+	if f.Requires[0] != "a" {
+		t.Fatal("Clone shares the Requires slice")
+	}
+	var back Flag
+	b, _ := json.Marshal(f)
+	if err := json.Unmarshal(b, &back); err != nil || len(back.Requires) != 2 {
+		t.Fatalf("round trip: %v %v", back.Requires, err)
+	}
+	b, _ = json.Marshal(Flag{Name: "plain"})
+	if strings.Contains(string(b), "requires") {
+		t.Fatalf("a flag with no prerequisites must not write the field: %s", b)
+	}
+}
