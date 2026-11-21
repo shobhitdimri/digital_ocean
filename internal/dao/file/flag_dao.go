@@ -7,9 +7,12 @@ import (
 	"os"
 	"path/filepath"
 
+	"feature-flag-service/internal/dao"
 	"feature-flag-service/internal/dao/memory"
 	"feature-flag-service/internal/domain"
 )
+
+var _ dao.FlagDAO = (*FlagDAO)(nil)
 
 // schemaVersion is bumped whenever the on-disk layout changes, so a newer file
 // is refused instead of being misread by an older binary.

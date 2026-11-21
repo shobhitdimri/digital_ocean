@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"sync"
 
+	"feature-flag-service/internal/dao"
 	"feature-flag-service/internal/domain"
 )
+
+var _ dao.AuditDAO = (*AuditDAO)(nil)
 
 // AuditDAO is a thread-safe, in-memory dao.AuditDAO.
 type AuditDAO struct {

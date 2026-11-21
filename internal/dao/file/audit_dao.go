@@ -12,9 +12,12 @@ import (
 	"path/filepath"
 	"sync"
 
+	"feature-flag-service/internal/dao"
 	"feature-flag-service/internal/domain"
 	"feature-flag-service/pkg/logger"
 )
+
+var _ dao.AuditDAO = (*AuditDAO)(nil)
 
 // AuditDAO is a file-backed dao.AuditDAO storing one JSON object per line
 // (JSON Lines). The file is append-only: entries are never rewritten.

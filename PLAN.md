@@ -259,19 +259,25 @@ Layering rules (enforced by review):
 ## 4. Key contracts
 
 ```go
-// internal/dao
-type FlagDAO interface {
-    Create(ctx context.Context, f domain.Flag) error
+// internal/dao - each contract is split into a read half and a write half
+type FlagReader interface {
     Get(ctx context.Context, name string) (domain.Flag, error)
     List(ctx context.Context) ([]domain.Flag, error)
-    Update(ctx context.Context, f domain.Flag) error
+}
+type FlagWriter interface {
+    Create(ctx context.Context, f domain.Flag) error
+    Update(ctx context.Context, f domain.Flag) error // optimistic: f.Version must be stored version + 1, else ErrConflict
     Delete(ctx context.Context, name string) error
 }
+type FlagDAO interface { FlagReader; FlagWriter }
 
-type AuditDAO interface {
+type AuditWriter interface {
     Append(ctx context.Context, e domain.AuditEntry) error
-    ListByFlag(ctx context.Context, name string, limit int) ([]domain.AuditEntry, error)
 }
+type AuditReader interface {
+    ListByFlag(ctx context.Context, flagName string, limit int) ([]domain.AuditEntry, error)
+}
+type AuditDAO interface { AuditWriter; AuditReader }
 
 // pkg/cache
 type Cache interface {
@@ -295,10 +301,19 @@ func New(cfg Config, log *slog.Logger) (*Cache, error) // error when Capacity < 
 func (c *Cache) SweepNow() int // removes expired entries, returns count (used by janitor and tests)
 func (c *Cache) Close() error  // idempotent (sync.Once): stops the ticker, waits for the goroutine
 
-// internal/evaluator
-type Rule interface {
-    Apply(ctx context.Context, in Input) (decision *Decision, err error) // nil decision = continue to next rule
+// internal/evaluator - declares the one capability it needs (dependency inversion);
+// dao.FlagReader satisfies it without the evaluator importing the dao package
+type FlagLookup interface {
+    Get(ctx context.Context, name string) (domain.Flag, error)
 }
+
+type Rule interface {
+    Name() string
+    Apply(ctx context.Context, in Input) (d Decision, decided bool, err error) // decided=false passes to the next rule
+}
+
+// Result carries Enabled, Reason, DecidedBy (rule name) and Consulted (every flag read,
+// used as the cache tags). Evaluate(ctx, flagName, userID) and EvaluateFlag(ctx, flag, userID).
 ```
 
 Domain model:
@@ -359,12 +374,20 @@ Rule chain, evaluated in order (each rule can return a decision or pass to the n
 
 1. Flag missing -> `ErrNotFound` (404).
 2. PrerequisiteRule (extension) - if any required flag is not enabled for this user -> false, reason `prerequisite_failed`. Uses a cycle-safe depth limit.
-3. OverrideRule - if the user has an override, return it, reason `user_override`.
-4. GlobalRule - if the flag is globally disabled -> false, reason `global_off`.
+3. `OverrideRule` - if the user has an override, return it, reason `user_override`.
+4. `GlobalOffRule` - if the flag is globally disabled -> false, reason `global_off`.
 5. RolloutRule (extension) - `fnv32a(flagName + ":" + userID) % 100 < RolloutPercent` -> true, otherwise false, reason `rollout_in` or `rollout_out`.
-6. Default -> true, reason `global_on`.
+6. `GlobalOnRule` (terminal) -> true, reason `global_on`.
 
-The evaluator is pure (inputs in, decision out), so the unit tests need no I/O. Adding the extensions means adding rules, not editing existing ones.
+The chain is built by `evaluator.DefaultRules()`. Extensions are added there, as new rules in the order above, without editing the Evaluator or the existing rules. The evaluator is pure (inputs in, decision out), so the unit tests need no I/O. A chain that ends without a decision fails with `ErrNoDecision`, which is a misconfiguration (500), not a client error.
+
+## 7a. Design principles applied (SOLID)
+
+- Single responsibility: each rule decides one concern, and the Evaluator only runs the chain. Caching, auditing and logging stay in the service layer.
+- Open/closed: percentage rollout and prerequisites are new rules in `DefaultRules()`. The Evaluator, the existing rules and the services do not change. Tests prove a new rule can be inserted without touching the Evaluator.
+- Liskov substitution: every `Rule` honours one documented contract (stateless, never mutates the flag, deterministic, undecided returns a zero Decision), enforced by a test over all rules. Every DAO implementation passes the same contract suite in `daotest`.
+- Interface segregation: DAOs are split into reader and writer halves, and consumers depend on the narrowest interface they use (the evaluator needs one `Get` method). Services declare their own small interfaces for the cache and the clock, rather than importing the largest one.
+- Dependency inversion: high-level code (`service`, `evaluator`) depends on interfaces declared by the consumer. Concrete types (file DAO, LFU cache, logger) are chosen only in `internal/app`.
 
 ## 8. Tickets
 
@@ -442,12 +465,15 @@ Why this shape: `main` only maps errors to an exit code. `run()` returns errors 
 - Unit tests: eviction order by frequency (and by recency on ties), TTL expiry (injectable clock), tag invalidation, a `-race` concurrency test, `SweepNow()` removes only expired entries and cleans the tag index, the janitor removes expired entries without any `Get`, and `Close()` stops the goroutine (verified with a goroutine count check or `goleak`) and can be called twice safely.
 
 ### FFS-6 Evaluator (P0)
-- `Evaluator`, the `Rule` interface, and `OverrideRule`, `GlobalRule`, with the rule chain wired in order.
-- Required unit tests: global on, global off, override on over global off, override off over global on, user without an override uses global, and flag not found.
+- `Evaluator`, the `Rule` interface, and `OverrideRule`, `GlobalOffRule`, `GlobalOnRule`, with the rule chain built by `DefaultRules()`. The evaluator declares its own `FlagLookup` interface and records every flag a rule reads (`Result.Consulted`) through a per-evaluation decorator, so rules stay unaware of cache tagging.
+- Also in this ticket (interface segregation): `dao.FlagDAO` and `dao.AuditDAO` are split into reader and writer halves, with compile-time checks that every implementation satisfies them.
+- Required unit tests: global on, global off, override on over global off, override off over global on, user without an override uses global, and flag not found. Plus: invalid input, cancelled context, storage errors not mistaken for not-found, a new rule inserted without changing the evaluator, first deciding rule wins, no-terminal-rule error, rule errors keep their sentinel, consulted-flag tracking, the rule contract for every default rule, and a concurrent evaluation test under `-race`.
 
 ### FFS-7 Services (P0)
 - `FlagService`: create, get, list, update, delete, set or remove override. Each write builds before and after snapshots, writes via the DAO, appends the audit entry (actor, time, before, after, request id), then invalidates the cache tag.
 - `EvaluationService`: cache-aside using key `eval:{flag}:{user}`, tagged with the flag and consulted prerequisites, and no caching of errors. On a miss it must follow the epoch protocol from FFS-5 to avoid caching a stale result: read `cache.Epoch()` first, then read the flag and evaluate, then store with `cache.SetIfEpoch(...)`. The result is still returned to the caller when the store is refused.
+- Interfaces and dependency injection (SOLID): the services declare the narrow interfaces they consume instead of importing concrete or wide types. `EvaluationService` takes `dao.FlagReader`, a cache interface with only `Get`, `Epoch` and `SetIfEpoch`, and a `Clock`. `FlagService` takes `dao.FlagDAO`, `dao.AuditWriter`, a cache interface with only `InvalidateTag`, a `Clock`, and an `IDGenerator` for audit ids. `Clock` and `IDGenerator` are one-method interfaces with fakes for deterministic tests.
+- Writes retry on `domain.ErrConflict` (optimistic version check from FFS-4) a small bounded number of times, then return 409.
 - Unit tests with the in-memory DAOs and a spy cache: a write invalidates, a hit skips the DAO, and audit entries have correct before and after values.
 
 ### FFS-8 HTTP layer (P0)

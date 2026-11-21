@@ -7,8 +7,11 @@ import (
 	"sort"
 	"sync"
 
+	"feature-flag-service/internal/dao"
 	"feature-flag-service/internal/domain"
 )
+
+var _ dao.FlagDAO = (*FlagDAO)(nil)
 
 // PersistFunc is called, under the store's write lock, with the complete
 // post-change state ordered by name. If it returns an error the change is
