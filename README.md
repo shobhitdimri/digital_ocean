@@ -8,7 +8,7 @@ A REST service, written in Go with only the standard library, that stores featur
 - **Audit trail:** who changed what, when, with the previous and the new value. See [Audit trail](#audit-trail).
 - **Production behaviour:** structured JSON logs with request ids, graceful shutdown, crash-safe file storage, and no data races (the tests run under `-race`).
 
-Planned but **not built yet**: the Docker/DigitalOcean deployment. See [Roadmap](#roadmap).
+Deployment files (Dockerfile, App Platform spec) are included; see [Deploying to DigitalOcean](#deploying-to-digitalocean). See [Roadmap](#roadmap).
 
 ## Contents
 
@@ -520,10 +520,33 @@ PLAN.md                the engineering plan: tickets, design decisions, diagrams
 
 `pkg/` holds code that has no knowledge of flags and could be reused as is.
 
+## Deploying to DigitalOcean
+
+The repository contains a `Dockerfile` (multi-stage, static binary, distroless, non-root user, exec-form `ENTRYPOINT` so the process is PID 1 and receives SIGTERM for the graceful shutdown) and an App Platform spec in `.do/app.yaml`.
+
+```bash
+# from a machine with doctl, once the code is in the GitHub repo named in the spec
+doctl apps create --spec .do/app.yaml
+doctl apps list                       # note the live URL, https://<app>.ondigitalocean.app
+
+curl https://<app>.ondigitalocean.app/healthz
+curl -X POST https://<app>.ondigitalocean.app/v1/flags -H 'X-Actor: me' -H 'Content-Type: application/json' \
+  -d '{"name":"new-ui","enabled":true,"rollout_percent":50}'
+curl 'https://<app>.ondigitalocean.app/v1/evaluate?flag=new-ui&user_id=alice'
+```
+
+Things to know before relying on it:
+
+- **Storage is ephemeral on App Platform.** Flags and the audit trail live in files under `/data`, which App Platform wipes on every redeploy and restart. That is fine for a demo and wrong for production. For real use run the same image on a Droplet with `-v /var/lib/ffs:/data -v /var/lib/ffs-logs:/logs`, or swap the file DAOs for a managed database (the DAO interfaces exist for this).
+- **There is no authentication.** `X-Actor` records who made a change, it does not prove it. A public deployment lets anyone create, change and delete flags. Put it behind a gateway or add API-key auth before putting real flags on it.
+- **Single instance only.** The cache and the file store are per process, so keep `instance_count: 1`.
+- **Shutdown window.** The platform's stop timeout must exceed `SHUTDOWN_DELAY + SHUTDOWN_TIMEOUT` (0 + 10s by default).
+- The image has been checked by building the binary with the Dockerfile's exact flags and running it against real files. The image build itself runs on DigitalOcean.
+
 ## Roadmap
 
 Percentage rollout and flag dependencies are built. Planned as the next ticket in `PLAN.md`:
 
-- **Deployment.** A Dockerfile and DigitalOcean deployment, with the stop timeout set above the graceful-shutdown window.
+- **Deployment.** The Dockerfile and App Platform spec are in place (see above); the live deployment is pending push access to the GitHub repository.
 
 Possible later work: Postgres in place of the JSON files, Redis or pub/sub invalidation for multiple instances, and an OpenAPI description.

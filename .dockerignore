@@ -1,0 +1,11 @@
+.git
+.github
+.do
+data
+logs
+bin
+coverage.out
+*.test
+sample_test
+PLAN.md
+README.md
